@@ -47,7 +47,7 @@ async def generate_report(portfolio: PortfolioInput):
         
         # Run the agent workflow
         # In a real app, this might be a background task (Celery/Arq)
-        result = agent.run(portfolio_dict)
+        result = agent.run(portfolio.user_id, portfolio_dict)
         
         return ReportResponse(
             user_id=portfolio.user_id,

@@ -1,116 +1,119 @@
-import json
 from typing import Dict, Any, List
+from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.output_parsers import StrOutputParser
-import os
+from langchain_core.tools import tool
+from app.analytics.risk_engine import calculate_portfolio_metrics
+from app.services.news_service import get_portfolio_news
+from app.core.memory import memory
+from app.core.config import settings
+import json
 
-# --- Mock Services ---
+# --- Tools ---
 
-def mock_calculate_risk(portfolio: Dict[str, Any]) -> Dict[str, Any]:
+@tool
+def analyze_portfolio_risk(holdings_json: str) -> str:
     """
-    Mock risk calculation engine (e.g., PyPortfolioOpt).
-    In reality, this would compute efficient frontier, Sharpe ratios, etc.
+    Calculates risk metrics (Sharpe, Volatility, Returns) for a given portfolio.
+    Input must be a JSON string of a list of holdings: [{"symbol": "AAPL", "value": 1000}, ...]
     """
-    # specific logic based on inputs to make it feel 'real'
-    holdings = portfolio.get("holdings", [])
-    total_value = sum(h.get("value", 0) for h in holdings)
-    
-    # Mock result
-    return {
-        "current_risk_score": 65,  # 0-100
-        "suggested_allocation": {
-            "stocks": 0.60,
-            "bonds": 0.30,
-            "crypto": 0.10
-        },
-        "volatility": "High" if total_value > 10000 else "Moderate",
-        "sharpe_ratio": 1.2
-    }
+    try:
+        holdings = json.loads(holdings_json)
+        metrics = calculate_portfolio_metrics(holdings)
+        return json.dumps(metrics)
+    except Exception as e:
+        return f"Error calculating risk: {str(e)}"
 
-#TODO
-def mock_fetch_news(portfolio: Dict[str, Any]) -> List[str]:
+@tool
+def fetch_market_news(tickers_json: str) -> str:
     """
-    Mock NLP News Intelligence Layer.
-    In reality, this would query Newspaper3k + Vector DB.
+    Searches for latest financial news for a list of tickers.
+    Input must be a JSON string of a list of ticker symbols: ["AAPL", "TSLA"]
     """
-    holdings = [h.get("symbol") for h in portfolio.get("holdings", [])]
-    news = []
-    
-    if "AAPL" in holdings:
-        news.append("Apple reports record quarterly earnings, beating expectations.")
-    if "TSLA" in holdings:
-        news.append("Tesla faces new regulatory scrutiny in Europe regarding FSD.")
-    if "BTC" in holdings:
-        news.append("Bitcoin surges past key resistance levels amidst global uncertainty.")
-        
-    if not news:
-        news.append("Market remains volatile as inflation data is awaited.")
-        
-    return news
+    try:
+        tickers = json.loads(tickers_json)
+        news_summary = get_portfolio_news(tickers)
+        return news_summary
+    except Exception as e:
+        return f"Error fetching news: {str(e)}"
 
-# --- The Agent Workflow ---
+# --- Agent Class ---
 
 class WealthManagerAgent:
     def __init__(self):
-        # Initialize LLM (Ensure GOOGLE_API_KEY is set in env)
+        # Tools available to the agent
+        self.tools = [analyze_portfolio_risk, fetch_market_news]
+        
+        # LLM
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash", 
-            temperature=0.7,
-            google_api_key=os.getenv("GOOGLE_API_KEY", "mock-key-if-not-set") 
-        )
-        
-        # Define the Prompt
-        self.prompt = ChatPromptTemplate.from_template(
-            """
-            You are an elite AI Wealth Manager. 
-            
-            Analyze the following user data and produce a concise, actionable investment recommendation.
-            
-            User Portfolio Context:
-            {portfolio_context}
-            
-            Risk Analysis:
-            {risk_analysis}
-            
-            Relevant Market News:
-            {news_insights}
-            
-            Output your response in a professional tone, addressing the user directly. 
-            Structure it as:
-            1. Portfolio Health Check
-            2. Key News Impacts
-            3. Recommended Actions
-            """
-        )
-        
-        # Build the Chain
-        # 1. Calculate Risk (Mock)
-        # 2. Fetch News (Mock)
-        # 3. Format everything for the prompt
-        # 4. Invoke LLM
-        self.chain = (
-            {
-                "portfolio_context": RunnablePassthrough(),
-                "risk_analysis": RunnableLambda(mock_calculate_risk),
-                "news_insights": RunnableLambda(mock_fetch_news)
-            }
-            | self.prompt
-            | self.llm
-            | StrOutputParser()
+            model="gemini-1.5-flash",
+            temperature=0.5,
+            google_api_key=settings.GOOGLE_API_KEY
         )
 
-    def run(self, user_portfolio: Dict[str, Any]) -> str:
+        # Prompt
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", 
+             """You are an expert AI Wealth Manager. Your goal is to provide personalized, data-driven investment advice.
+             
+             User Profile:
+             {user_profile}
+             
+             You have access to tools to calculate real-time risk metrics and fetch live news.
+             ALWAYS use the 'analyze_portfolio_risk' tool first to get the ground truth on the portfolio's performance.
+             Then use 'fetch_market_news' to understand the context for the major holdings.
+             
+             Synthesize all data into a professional report.
+             Structure your response clearly:
+             1. **Portfolio Health Check**: Use the metrics (Sharpe, Volatility).
+             2. **News Intelligence**: Summarize key drivers found in news.
+             3. **Strategic Recommendations**: Actionable advice based on risk profile and market data.
+             """),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+        
+        # Construct the Agent
+        self.agent = create_tool_calling_agent(self.llm, self.tools, self.prompt)
+        self.agent_executor = AgentExecutor(agent=self.agent, tools=self.tools, verbose=True)
+
+    def run(self, user_id: str, portfolio: Dict[str, Any]) -> str:
         """
-        Executes the wealth manager workflow.
+        Main entry point.
         """
+        # 1. Retrieve User Memory
+        user_profile = memory.get_user_profile(user_id)
+        profile_str = json.dumps(user_profile, indent=2)
+        
+        # 2. Prepare Input
+        # We pass the portfolio directly in the input string so the model knows what to pass to tools
+        holdings = portfolio.get("holdings", [])
+        holdings_simple = [{"symbol": h["symbol"], "value": h["value"]} for h in holdings]
+        tickers = [h["symbol"] for h in holdings_simple]
+        
+        input_text = f"""
+        Here is my current portfolio:
+        {json.dumps(holdings_simple)}
+        
+        My risk tolerance is: {portfolio.get('risk_tolerance', 'Moderate')}
+        
+        Please generate a comprehensive wealth report.
+        """
+        
+        # 3. Execute
         try:
-            # invocing the chain
-            result = self.chain.invoke(user_portfolio)
-            return result
+            result = self.agent_executor.invoke({
+                "input": input_text,
+                "user_profile": profile_str
+            })
+            response = result['output']
+            
+            # 4. Save Interaction to Memory
+            memory.add_interaction(user_id, input_text, response)
+            
+            return response
         except Exception as e:
-            return f"Error executing agent workflow: {str(e)}"
+            return f"Agent Error: {str(e)}"
 
-# Singleton instance for easy import
+# Singleton
 agent = WealthManagerAgent()
