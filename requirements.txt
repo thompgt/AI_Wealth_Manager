@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langgraph
+sqlalchemy
+psycopg2-binary
+google-generativeai
+pydantic
+pydantic-settings
+pytest
+httpx
