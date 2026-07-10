@@ -1,5 +1,14 @@
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, JSON, ForeignKey
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+    JSON,
+    ForeignKey,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from config import settings
 
@@ -7,73 +16,150 @@ from config import settings
 db_url = settings.NEON_DATABASE_URL
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(db_url)
 elif "sqlite" in db_url:
-    # Adding connect_args for SQLite
     engine = create_engine(db_url, connect_args={"check_same_thread": False})
 else:
-    engine = create_engine(db_url)
-
-if "sqlite" not in db_url:
     engine = create_engine(db_url)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-class UserProfile(Base):
-    __tablename__ = "user_profiles"
+
+class ClientProfile(Base):
+    __tablename__ = "client_profiles"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
+    email = Column(String, nullable=True)
+    age = Column(Integer, default=0)
+    # "Conservative" | "Moderate" | "Aggressive"
+    risk_tolerance = Column(String, default="Moderate")
+    time_horizon_years = Column(Integer, default=10)
+    # e.g. ["retirement", "home purchase"]
+    goals = Column(JSON, default=list)
     net_worth = Column(Float, default=0.0)
-    # Portfolio breakdown: e.g., {"AAPL": 100000, "CASH": 400000}
-    portfolio = Column(JSON, default={})
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Holding(Base):
+    __tablename__ = "holdings"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("client_profiles.id"), index=True)
+    symbol = Column(String, index=True)
+    # For the CASH pseudo-asset: quantity holds the dollar amount, cost_basis is 1.0
+    quantity = Column(Float, default=0.0)
+    cost_basis = Column(Float, default=0.0)
+    acquired_at = Column(DateTime, default=datetime.utcnow)
+
 
 class TransactionLog(Base):
     __tablename__ = "transaction_logs"
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("user_profiles.id"))
+    client_id = Column(Integer, ForeignKey("client_profiles.id"), index=True)
     asset_symbol = Column(String, index=True)
     transaction_type = Column(String)  # "BUY" or "SELL"
     amount = Column(Float)
     price_per_unit = Column(Float)
     timestamp = Column(DateTime, default=datetime.utcnow)
 
+
+class AgentRun(Base):
+    __tablename__ = "agent_runs"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("client_profiles.id"), index=True)
+    run_id = Column(String, index=True)  # groups all nodes of one graph execution
+    node_name = Column(String)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    input_snapshot = Column(JSON, default=dict)
+    output_snapshot = Column(JSON, default=dict)
+    model_used = Column(String, nullable=True)
+    status = Column(String, default="success")  # success | error | interrupted
+    error_detail = Column(String, nullable=True)
+
+
+class Report(Base):
+    __tablename__ = "reports"
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("client_profiles.id"), index=True)
+    run_id = Column(String, index=True)
+    generated_at = Column(DateTime, default=datetime.utcnow)
+    report_text = Column(String)
+    structured_payload = Column(JSON, default=dict)
+    version = Column(Integer, default=1)
+
+
+class MarketDataCache(Base):
+    __tablename__ = "market_data_cache"
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String, index=True)
+    as_of_date = Column(DateTime, index=True)
+    close_price = Column(Float)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Approval(Base):
+    __tablename__ = "approvals"
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String, index=True)
+    requested_at = Column(DateTime, default=datetime.utcnow)
+    decided_at = Column(DateTime, nullable=True)
+    decided_by = Column(String, nullable=True)
+    decision = Column(String, nullable=True)  # approved | rejected
+    notes = Column(String, nullable=True)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     print("Database tables initialized.")
 
+
 def seed_db():
     db: Session = SessionLocal()
-    if db.query(UserProfile).first():
+    if db.query(ClientProfile).first():
         print("Database already seeded.")
         db.close()
         return
 
-    # Create dummy user with $500k net worth
-    user = UserProfile(
+    # Create a dev/demo client: $500k net worth, moderate risk tolerance,
+    # 20-year horizon, saving for retirement.
+    client = ClientProfile(
         name="Test User",
+        email="test.user@example.com",
+        age=45,
+        risk_tolerance="Moderate",
+        time_horizon_years=20,
+        goals=["retirement", "home purchase"],
         net_worth=500000.0,
-        portfolio={"CASH": 400000.0, "TSLA": 100000.0}
     )
-    db.add(user)
+    db.add(client)
     db.commit()
-    db.refresh(user)
+    db.refresh(client)
 
-    # Add trades from 15 days ago for wash-sale testing (e.g. sold TSLA at a loss)
-    # The rule is: if sold at loss within 30 days, cannot buy back. 
-    # Let's mock a SELL transaction for TSLA 15 days ago
+    holdings = [
+        Holding(client_id=client.id, symbol="CASH", quantity=400000.0, cost_basis=1.0),
+        Holding(client_id=client.id, symbol="TSLA", quantity=400.0, cost_basis=250.0,
+                acquired_at=datetime.utcnow() - timedelta(days=200)),
+    ]
+    db.add_all(holdings)
+
+    # Trade from 15 days ago for wash-sale testing: sold TSLA at a loss.
+    # Rule: if sold at a loss within 30 days, cannot buy back the same asset.
     past_date = datetime.utcnow() - timedelta(days=15)
     trade = TransactionLog(
-        user_id=user.id,
+        client_id=client.id,
         asset_symbol="TSLA",
         transaction_type="SELL",
         amount=10000.0,
         price_per_unit=150.0,
-        timestamp=past_date
+        timestamp=past_date,
     )
     db.add(trade)
     db.commit()
-    print("Database seeded with mock user profile and transaction log.")
+    print("Database seeded with mock client profile, holdings, and transaction log.")
     db.close()
+
 
 if __name__ == "__main__":
     init_db()
