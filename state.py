@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Optional, TypedDict
+import operator
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 
 class ClientProfile(TypedDict):
@@ -79,8 +80,13 @@ class AgentState(TypedDict):
     # Set by Finance Report Agent
     final_report: Optional[str]
 
-    # Appended to by every node
-    audit_trail: List[AgentRunRecord]
+    # Appended to by every node. Annotated with operator.add so LangGraph
+    # concatenates each node's returned list instead of overwriting it --
+    # required because Portfolio Diagnostics/Market Regime and
+    # Suitability/Tax-Awareness write this key concurrently in parallel
+    # branches. Each node should return {"audit_trail": [its_own_record]},
+    # never the full accumulated list.
+    audit_trail: Annotated[List[AgentRunRecord], operator.add]
 
     # Human-in-the-loop control flow
     requires_human_approval: bool
