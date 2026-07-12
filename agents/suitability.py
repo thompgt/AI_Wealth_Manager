@@ -128,52 +128,74 @@ def _check_security_quality(ticker: str, info: Optional[Dict[str, Any]]) -> Opti
     return None
 
 
-def _check_position_limit(
-    ticker: str,
+MIN_ALLOCATION_DOLLARS = 100.0
+
+
+def _compute_allocations(
+    candidates: List[Candidate],
     client_profile: Dict[str, Any],
-    num_candidates: int,
-) -> Optional[str]:
-    """Rule 2: risk-tier-scaled position limit.
+) -> Dict[str, float]:
+    """Rule 2 + sizing: decide how many actual dollars to put into each
+    surviving candidate, replacing the legacy flat 30%-of-net-worth cap AND
+    the old "does this cross a limit" yes/no check with a real portfolio-
+    construction decision.
 
-    Replaces the legacy flat 30%-of-net-worth cap.
-
-    SIMULATED SIZING ASSUMPTION: `Candidate` carries no proposed dollar trade
-    size -- this system doesn't do live trade sizing yet, that's a future
-    execution-layer concern. To still give this rule something concrete to
-    check today, we simulate a "default" position size as the smaller of:
-      (a) 5% of net worth -- a conservative default single-trade size, and
-      (b) an even split of available cash across every candidate under
-          consideration this run (available_cash / number_of_candidates).
-    This is a deliberate, documented stand-in, not an oversight: it lets the
-    guardrail catch obviously-oversized recommendations today without
-    pretending to know a real trade size nothing upstream has decided on yet.
-    The simulated size is added to any EXISTING holding in the same symbol
-    before comparing to the risk-tier cap, since a client may already be
-    partially positioned.
+    Available CASH is distributed across candidates weighted by each
+    candidate's confidence score (equal-weighted if every confidence is 0),
+    with each ticker capped at the client's risk-tier position limit (as a
+    fraction of net worth, net of any existing holding in that symbol). Cash
+    that would overflow a capped-out ticker is redistributed across the
+    remaining open tickers in further passes (simple water-filling), so
+    available cash gets used even when confidence is skewed toward a name
+    that's already near its cap.
     """
     net_worth = client_profile.get("net_worth", 0.0)
     holdings = client_profile.get("holdings", {})
     available_cash = holdings.get("CASH", 0.0)
     risk_tolerance = client_profile.get("risk_tolerance", "Moderate")
-
     cap_fraction = RISK_TIER_POSITION_CAP.get(risk_tolerance, DEFAULT_POSITION_CAP)
 
-    if num_candidates <= 0 or net_worth <= 0:
-        return None  # nothing meaningful to check
+    tickers = [c["ticker"] for c in candidates]
+    allocation = {t: 0.0 for t in tickers}
+    if not tickers or available_cash <= 0 or net_worth <= 0:
+        return allocation
 
-    simulated_position = min(0.05 * net_worth, available_cash / num_candidates)
-    existing_holding = holdings.get(ticker, 0.0)
-    resulting_position = existing_holding + simulated_position
-    resulting_fraction = resulting_position / net_worth
+    cap_dollar = cap_fraction * net_worth
+    max_amount = {t: max(0.0, cap_dollar - holdings.get(t, 0.0)) for t in tickers}
 
-    if resulting_fraction > cap_fraction:
-        return (
-            f"{ticker}: rejected -- simulated position (existing ${existing_holding:,.0f} + "
-            f"new ${simulated_position:,.0f} = ${resulting_position:,.0f}) would be "
-            f"{resulting_fraction:.1%} of net worth (${net_worth:,.0f}), exceeding the "
-            f"{risk_tolerance} client's {cap_fraction:.0%} single-position cap."
-        )
-    return None
+    confidences = {c["ticker"]: max(c.get("confidence", 0.0), 0.0) for c in candidates}
+    total_conf = sum(confidences.values())
+    weight = (
+        {t: v / total_conf for t, v in confidences.items()}
+        if total_conf > 0
+        else {t: 1.0 / len(tickers) for t in tickers}
+    )
+
+    remaining_cash = available_cash
+    open_tickers = set(tickers)
+    for _ in range(5):  # water-filling passes -- converges fast for <=5 candidates
+        if remaining_cash <= 0 or not open_tickers:
+            break
+        open_weight_sum = sum(weight[t] for t in open_tickers)
+        if open_weight_sum <= 0:
+            break
+        distributed = 0.0
+        newly_capped = []
+        for t in list(open_tickers):
+            share = remaining_cash * (weight[t] / open_weight_sum)
+            room = max_amount[t] - allocation[t]
+            give = min(share, room)
+            allocation[t] += give
+            distributed += give
+            if allocation[t] >= max_amount[t] - 1e-9:
+                newly_capped.append(t)
+        remaining_cash -= distributed
+        for t in newly_capped:
+            open_tickers.discard(t)
+        if distributed <= 1e-9:
+            break
+
+    return allocation
 
 
 def _check_age_horizon_volatility(
@@ -233,8 +255,7 @@ def suitability_node(state: AgentState) -> dict:
     _diagnostics = state.get("portfolio_diagnostics")
 
     violations: List[str] = []
-    adjusted_recommendations: List[Candidate] = []
-    num_candidates = len(candidates)
+    quality_passed: List[Candidate] = []
 
     try:
         for candidate in candidates:
@@ -243,16 +264,36 @@ def suitability_node(state: AgentState) -> dict:
 
             reason = _check_security_quality(ticker, info)
             if reason is None:
-                reason = _check_position_limit(ticker, client_profile, num_candidates)
-            if reason is None:
                 reason = _check_age_horizon_volatility(ticker, info, client_profile)
 
             if reason is not None:
                 print(f"    [Suitability] REJECTED {ticker}: {reason}")
                 violations.append(reason)
             else:
-                print(f"    [Suitability] APPROVED {ticker}")
-                adjusted_recommendations.append(candidate)
+                quality_passed.append(candidate)
+
+        net_worth = client_profile.get("net_worth", 0.0)
+        allocations = _compute_allocations(quality_passed, client_profile)
+
+        adjusted_recommendations: List[Candidate] = []
+        for candidate in quality_passed:
+            ticker = candidate["ticker"]
+            amount = allocations.get(ticker, 0.0)
+            if amount < MIN_ALLOCATION_DOLLARS:
+                print(f"    [Suitability] REJECTED {ticker}: no available allocation room")
+                violations.append(
+                    f"{ticker}: rejected -- no meaningful room to add (${amount:,.0f} available) "
+                    f"after risk-tier position caps and existing holdings were applied."
+                )
+                continue
+            print(f"    [Suitability] APPROVED {ticker}: allocating ${amount:,.0f}")
+            adjusted_recommendations.append(
+                {
+                    **candidate,
+                    "allocation_amount": round(amount, 2),
+                    "allocation_pct": round(amount / net_worth, 4) if net_worth > 0 else 0.0,
+                }
+            )
 
         approved = len(adjusted_recommendations) > 0
 
@@ -263,8 +304,9 @@ def suitability_node(state: AgentState) -> dict:
         }
 
         summary = (
-            f"Evaluated {num_candidates} candidate(s): {len(adjusted_recommendations)} approved, "
-            f"{len(violations)} violation(s) recorded."
+            f"Evaluated {len(candidates)} candidate(s): {len(adjusted_recommendations)} approved "
+            f"with a total of ${sum(c['allocation_amount'] for c in adjusted_recommendations):,.0f} "
+            f"allocated, {len(violations)} violation(s) recorded."
         )
         print(f"    [Suitability] {summary}")
 
@@ -304,17 +346,18 @@ if __name__ == "__main__":
     # Realistic sample AgentState for a Conservative client.
     # net_worth = 50,000; Conservative cap = 15% = $7,500 per single position.
     #
-    # Two candidates:
+    # Two candidates, $5,000 available CASH to deploy:
     #   - AAPL: real large-cap, major-exchange ticker that clears the
     #     security-quality screen (Rule 1) and the beta check (Rule 3, since
     #     this client is 45 / 20yr horizon so the rule doesn't even apply) --
-    #     but the client ALREADY holds $6,500 of AAPL, and with cash split
-    #     evenly across the 2 candidates the simulated new position pushes
-    #     the total to $9,000 = 18% of net worth, over the 15% cap. This is
-    #     the constructed, real, triggered position-limit violation.
-    #   - JNJ: real large-cap, major-exchange ticker, no existing holding,
-    #     simulated position is well under the cap -- should sail through
-    #     and land in adjusted_recommendations.
+    #     but the client ALREADY holds $7,500 of AAPL, exactly at the 15%
+    #     Conservative cap, so there is zero room left to add more. Expect
+    #     it to clear the quality/beta checks but get rejected at the sizing
+    #     step for having no available allocation room.
+    #   - JNJ: real large-cap, major-exchange ticker, no existing holding --
+    #     should receive the full $5,000 of available cash (nothing left to
+    #     compete for it once AAPL is capped out) and land in
+    #     adjusted_recommendations with that allocation.
     sample_state: AgentState = {
         "run_id": "test-run-001",
         "client_profile": {
@@ -325,7 +368,7 @@ if __name__ == "__main__":
             "goals": ["retirement"],
             "holdings": {
                 "CASH": 5000.0,
-                "AAPL": 6500.0,
+                "AAPL": 7500.0,
             },
             "net_worth": 50000.0,
         },
@@ -378,4 +421,6 @@ if __name__ == "__main__":
     print("violations:", sr["violations"])
     assert "JNJ" in approved_tickers, "expected JNJ to be approved"
     assert any("AAPL" in v and "cap" in v for v in sr["violations"]), "expected AAPL position-limit violation"
-    print("\nAll assertions passed: clean candidate approved, oversized position rejected.")
+    jnj = next(c for c in sr["adjusted_recommendations"] if c["ticker"] == "JNJ")
+    assert jnj["allocation_amount"] == 5000.0, f"expected JNJ to receive all $5,000 cash, got {jnj['allocation_amount']}"
+    print("\nAll assertions passed: clean candidate sized and approved, capped-out position rejected.")

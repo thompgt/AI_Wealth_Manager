@@ -58,24 +58,23 @@ def answers_to_tier(answers):
 def RiskQuestionnaire(answers, set_answers):
     solara.Markdown("**Risk Tolerance Questionnaire**")
     for i, q in enumerate(RISK_QUESTIONS):
-        solara.Markdown(f"{i + 1}. {q['text']}")
-        current = answers[i]
+        label_to_score = {label: score for label, score in q["options"]}
+        score_to_label = {score: label for label, score in q["options"]}
+        current_label = score_to_label.get(answers[i])
 
-        def make_setter(idx):
-            def setter(value):
+        def make_setter(idx, label_map):
+            def setter(label):
                 new_answers = list(answers)
-                new_answers[idx] = value
+                new_answers[idx] = label_map.get(label)
                 set_answers(new_answers)
             return setter
 
-        solara.ToggleButtonsSingle(
-            value=current,
-            values=[score for _, score in q["options"]],
-            on_value=make_setter(i),
+        solara.Select(
+            label=q["text"],
+            value=current_label,
+            values=[label for label, _ in q["options"]],
+            on_value=make_setter(i, label_to_score),
         )
-        labels = {score: label for label, score in q["options"]}
-        if current is not None:
-            solara.Markdown(f"*Selected: {labels.get(current, '')}*")
 
     tier = answers_to_tier(answers)
     if tier:
@@ -90,6 +89,7 @@ def NewClientForm(on_created):
     horizon, set_horizon = solara.use_state(10)
     goals_text, set_goals_text = solara.use_state("retirement")
     net_worth, set_net_worth = solara.use_state(100000.0)
+    portfolio_mode, set_portfolio_mode = solara.use_state("New investment (let the agents build it)")
     holdings_rows, set_holdings_rows = solara.use_state([{"symbol": "CASH", "quantity": 100000.0, "cost_basis": 1.0}])
     answers, set_answers = solara.use_state([None, None, None])
     error, set_error = solara.use_state(None)
@@ -104,24 +104,42 @@ def NewClientForm(on_created):
     RiskQuestionnaire(answers, set_answers)
     tier = answers_to_tier(answers)
 
-    solara.Markdown("**Holdings**")
-    for idx, row in enumerate(holdings_rows):
-        with solara.Row():
-            def make_row_setter(i, field):
-                def setter(value):
-                    new_rows = [dict(r) for r in holdings_rows]
-                    new_rows[i][field] = value
-                    set_holdings_rows(new_rows)
-                return setter
+    solara.Select(
+        label="Portfolio setup",
+        value=portfolio_mode,
+        values=["New investment (let the agents build it)", "I have an existing portfolio"],
+        on_value=set_portfolio_mode,
+    )
 
-            solara.InputText("Symbol", value=row["symbol"], on_value=make_row_setter(idx, "symbol"))
-            solara.InputFloat("Quantity ($ for CASH)", value=row["quantity"], on_value=make_row_setter(idx, "quantity"))
-            solara.InputFloat("Cost basis", value=row["cost_basis"], on_value=make_row_setter(idx, "cost_basis"))
+    if portfolio_mode == "New investment (let the agents build it)":
+        solara.Info(
+            f"Your full ${net_worth:,.0f} will start as uninvested cash. Running analysis will "
+            "have the agents diagnose that as 100% cash drag and pick specific stocks/ETFs and "
+            "dollar amounts to deploy it into."
+        )
+    else:
+        solara.Markdown("**Current Holdings**")
+        for idx, row in enumerate(holdings_rows):
+            with solara.Row():
+                def make_row_setter(i, field):
+                    def setter(value):
+                        new_rows = [dict(r) for r in holdings_rows]
+                        new_rows[i][field] = value
+                        set_holdings_rows(new_rows)
+                    return setter
 
-    def add_row():
-        set_holdings_rows(holdings_rows + [{"symbol": "", "quantity": 0.0, "cost_basis": 0.0}])
+                solara.InputText("Symbol", value=row["symbol"], on_value=make_row_setter(idx, "symbol"))
+                solara.InputFloat("Quantity ($ for CASH)", value=row["quantity"], on_value=make_row_setter(idx, "quantity"))
+                solara.InputFloat("Cost basis", value=row["cost_basis"], on_value=make_row_setter(idx, "cost_basis"))
 
-    solara.Button("+ Add holding", on_click=add_row)
+        def add_row():
+            set_holdings_rows(holdings_rows + [{"symbol": "", "quantity": 0.0, "cost_basis": 0.0}])
+
+        solara.Button("+ Add holding", on_click=add_row)
+        solara.Markdown(
+            "Any uninvested cash you list above (symbol `CASH`) is what the agents will have "
+            "available to deploy into new recommendations."
+        )
 
     @solara.lab.use_task(dependencies=None)
     async def submit_task():
@@ -130,6 +148,11 @@ def NewClientForm(on_created):
             return
         set_error(None)
         try:
+            if portfolio_mode == "New investment (let the agents build it)":
+                holdings_payload = [{"symbol": "CASH", "quantity": net_worth, "cost_basis": 1.0}]
+            else:
+                holdings_payload = [r for r in holdings_rows if r["symbol"]]
+
             payload = {
                 "name": name,
                 "email": email or None,
@@ -138,7 +161,7 @@ def NewClientForm(on_created):
                 "time_horizon_years": horizon,
                 "goals": [g.strip() for g in goals_text.split(",") if g.strip()],
                 "net_worth": net_worth,
-                "holdings": [r for r in holdings_rows if r["symbol"]],
+                "holdings": holdings_payload,
             }
             async with httpx.AsyncClient() as client:
                 response = await client.post(f"{API_BASE}/clients", json=payload, headers=HEADERS, timeout=30.0)
@@ -200,10 +223,14 @@ def RecommendationsPanel(suitability):
     with solara.Card("Recommended Candidates"):
         recs = suitability.get("adjusted_recommendations") or []
         if recs:
+            total_allocated = sum(r.get("allocation_amount", 0.0) for r in recs)
+            solara.Markdown(f"**Total recommended allocation: ${total_allocated:,.0f}**")
             df = pd.DataFrame(
                 [
                     {
                         "Ticker": r.get("ticker"),
+                        "Allocation ($)": r.get("allocation_amount", 0.0),
+                        "Allocation (%)": r.get("allocation_pct", 0.0) * 100,
                         "Addresses Flaw": r.get("addresses_flaw"),
                         "Rationale": r.get("regime_fit_rationale"),
                         "Confidence": r.get("confidence"),
@@ -212,6 +239,8 @@ def RecommendationsPanel(suitability):
                 ]
             )
             solara.DataFrame(df)
+            fig = px.pie(df, values="Allocation ($)", names="Ticker", title="Recommended Allocation")
+            solara.FigurePlotly(fig)
         else:
             solara.Markdown("No candidates were approved this cycle.")
 

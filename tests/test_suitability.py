@@ -1,9 +1,19 @@
 from agents.suitability import (
     MIN_MARKET_CAP,
     _check_age_horizon_volatility,
-    _check_position_limit,
     _check_security_quality,
+    _compute_allocations,
 )
+
+
+def _candidate(ticker, confidence=0.5):
+    return {
+        "ticker": ticker,
+        "valuation_metrics": {},
+        "addresses_flaw": "test",
+        "regime_fit_rationale": "test",
+        "confidence": confidence,
+    }
 
 
 def test_security_quality_rejects_missing_info():
@@ -29,31 +39,48 @@ def test_security_quality_passes_large_cap_major_exchange():
     assert _check_security_quality("AAPL", info) is None
 
 
-def test_position_limit_rejects_oversized_position():
+def test_compute_allocations_caps_a_ticker_already_at_its_limit():
+    # Conservative cap = 15% of $50,000 = $7,500; AAPL already holds exactly
+    # that, so it should get $0 of the available $5,000 cash.
     profile = {
         "net_worth": 50000.0,
-        "holdings": {"CASH": 5000.0, "AAPL": 6500.0},
+        "holdings": {"CASH": 5000.0, "AAPL": 7500.0},
         "risk_tolerance": "Conservative",
     }
-    # Matches the scenario documented in agents/suitability.py's own __main__
-    # smoke test: existing $6,500 AAPL + simulated new position pushes the
-    # client over the 15% Conservative cap.
-    reason = _check_position_limit("AAPL", profile, num_candidates=2)
-    assert reason is not None
-    assert "cap" in reason
+    allocations = _compute_allocations([_candidate("AAPL"), _candidate("JNJ")], profile)
+    assert allocations["AAPL"] == 0.0
+    assert allocations["JNJ"] == 5000.0
 
 
-def test_position_limit_allows_small_new_position():
+def test_compute_allocations_splits_cash_by_confidence():
     profile = {
-        "net_worth": 50000.0,
-        "holdings": {"CASH": 5000.0},
-        "risk_tolerance": "Conservative",
+        "net_worth": 1000000.0,  # cap is high enough that no ticker gets capped out
+        "holdings": {"CASH": 10000.0},
+        "risk_tolerance": "Aggressive",
     }
-    assert _check_position_limit("JNJ", profile, num_candidates=2) is None
+    allocations = _compute_allocations(
+        [_candidate("A", confidence=0.75), _candidate("B", confidence=0.25)], profile
+    )
+    assert abs(allocations["A"] - 7500.0) < 1e-6
+    assert abs(allocations["B"] - 2500.0) < 1e-6
 
 
-def test_position_limit_skipped_with_no_candidates_or_net_worth():
-    assert _check_position_limit("AAPL", {"net_worth": 0.0, "holdings": {}}, num_candidates=0) is None
+def test_compute_allocations_equal_weight_when_all_confidences_zero():
+    profile = {
+        "net_worth": 1000000.0,
+        "holdings": {"CASH": 10000.0},
+        "risk_tolerance": "Aggressive",
+    }
+    allocations = _compute_allocations(
+        [_candidate("A", confidence=0.0), _candidate("B", confidence=0.0)], profile
+    )
+    assert abs(allocations["A"] - 5000.0) < 1e-6
+    assert abs(allocations["B"] - 5000.0) < 1e-6
+
+
+def test_compute_allocations_empty_with_no_cash_or_net_worth():
+    profile = {"net_worth": 0.0, "holdings": {}, "risk_tolerance": "Moderate"}
+    assert _compute_allocations([_candidate("AAPL")], profile) == {"AAPL": 0.0}
 
 
 def test_age_horizon_volatility_rule_does_not_apply_to_young_long_horizon_client():

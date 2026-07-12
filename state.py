@@ -36,6 +36,13 @@ class Candidate(TypedDict):
     addresses_flaw: str  # which PortfolioDiagnostics.flaws entry this fixes
     regime_fit_rationale: str
     confidence: float  # 0-1
+    # Set by the Suitability/Compliance Guardrail agent (0.0 until then): the
+    # actual dollar amount recommended for this position, and that amount as
+    # a fraction of the client's net worth. Sized from available CASH,
+    # weighted by confidence, and capped by the client's risk-tier position
+    # limit -- see agents/suitability.py::_compute_allocations.
+    allocation_amount: float
+    allocation_pct: float
 
 
 class SuitabilityResult(TypedDict):

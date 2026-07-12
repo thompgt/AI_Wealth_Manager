@@ -69,8 +69,10 @@ annual_volatility, and diversification_score, and explain the specific flaws \
 in plain language.
 2. Market Context -- cite the regime_label, confidence, and narrative.
 3. Recommendations -- for each approved candidate, explain what flaw it \
-addresses, why it fits the current market regime, and cite its valuation \
-metrics.
+addresses, why it fits the current market regime, cite its valuation \
+metrics, and state the specific recommended dollar allocation \
+(allocation_amount) and what fraction of net worth it represents \
+(allocation_pct).
 4. What We Filtered Out and Why -- plainly summarize any suitability \
 violations that caused candidates or actions to be blocked/adjusted, so the \
 client understands the system applies real guardrails rather than blindly \
@@ -211,7 +213,9 @@ def _fallback_recommendations(suitability_result: Dict[str, Any]) -> str:
         metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items()) or "no metrics provided"
         confidence = c.get("confidence")
         confidence_str = _pct(confidence) if isinstance(confidence, (int, float)) else "N/A"
-        lines.append(f"- {ticker} (confidence: {confidence_str})")
+        allocation_amount = c.get("allocation_amount", 0.0)
+        allocation_pct = c.get("allocation_pct", 0.0)
+        lines.append(f"- {ticker}: recommended allocation ${allocation_amount:,.0f} ({_pct(allocation_pct)} of net worth, confidence: {confidence_str})")
         lines.append(f"    Addresses: {addresses}")
         lines.append(f"    Why it fits the current regime: {rationale}")
         lines.append(f"    Valuation metrics: {metrics_str}")
