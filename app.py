@@ -255,13 +255,21 @@ def RecommendationsPanel(suitability):
 
 
 @solara.component
-def TaxPanel(tax_assessment):
+def TaxPanel(tax_assessment, tax_blocked=None):
     if not tax_assessment:
         return
     with solara.Card("Tax Notes"):
         flags = tax_assessment.get("wash_sale_flags") or []
         notes = tax_assessment.get("tax_efficiency_notes") or []
-        if flags:
+        if tax_blocked:
+            # Show the enforcement, not just the finding. A flag the client
+            # can see next to a recommendation they were still given is worse
+            # than no flag at all.
+            solara.Warning(
+                "Blocked from this cycle's recommendations by the wash-sale rule: "
+                + ", ".join(tax_blocked)
+            )
+        elif flags:
             solara.Markdown("**Wash-sale flagged tickers:** " + ", ".join(flags))
         for n in notes:
             solara.Markdown(f"- {n}")
@@ -284,10 +292,22 @@ def ResultsView(run_result, on_approve):
         return
 
     solara.Success("Analysis complete.")
+
+    # Be explicit when the AI layer is off. Without this the deterministic
+    # fallbacks are indistinguishable from real model output in the UI, and a
+    # dead LLM layer can run unnoticed for months.
+    if run_result.get("llm_enabled") is False:
+        solara.Warning(
+            "No GEMINI_API_KEY is configured, so the market regime call, stock ranking "
+            "and written report below came from the system's deterministic fallbacks "
+            "rather than the LLM. The quantitative analysis and all guardrails are "
+            "unaffected -- those never use an LLM."
+        )
+
     PortfolioDiagnosticsPanel(run_result.get("portfolio_diagnostics"))
     MarketRegimePanel(run_result.get("market_regime"))
     RecommendationsPanel(run_result.get("suitability_result"))
-    TaxPanel(run_result.get("tax_assessment"))
+    TaxPanel(run_result.get("tax_assessment"), run_result.get("tax_blocked_recommendations"))
 
     with solara.Card("Full Report"):
         solara.Markdown(run_result.get("final_report") or "No report generated.")

@@ -3,8 +3,9 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 .env
-backend/.env
 *.db
+*.sqlite
+checkpoints.sqlite*
 .venv/
 venv/
 .ipynb_checkpoints/
