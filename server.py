@@ -9,21 +9,81 @@ Endpoints:
                            GET  /api/v1/reports/{report_id}
   Approvals            -- POST /api/v1/runs/{run_id}/approve
 
-All endpoints require an `X-API-Key` header matching settings.API_AUTH_KEY.
+All endpoints except /health require an `X-API-Key` header matching
+settings.API_AUTH_KEY.
 """
 
-from datetime import datetime
-from typing import Dict, List, Optional
+import secrets
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import List, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config import settings
-from db import AgentRun, Approval, ClientProfile, Holding, Report, SessionLocal
+from db import AgentRun, Approval, ClientProfile, Holding, Report, SessionLocal, init_db, utcnow
+from logging_setup import configure_logging, get_logger
 from orchestrator import resume_client_graph, run_client_graph
 
-app = FastAPI(title="AI Wealth Manager Engine")
+configure_logging()
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Startup checks.
+
+    Two things had to move here. First, nothing ever called `init_db()` in
+    the serving path, so a fresh deployment answered every request with a
+    'no such table' 500 until somebody remembered to run `python db.py` by
+    hand. Second, the app booted happily with the built-in development API
+    key and a placeholder Gemini key -- i.e. it would serve an unauthenticated,
+    AI-less system to production traffic without a word of complaint.
+    """
+    init_db()
+
+    problems = settings.validate_for_environment()
+    if problems:
+        for problem in problems:
+            logger.critical("FATAL CONFIG: %s", problem)
+        raise RuntimeError(
+            f"Refusing to start in ENVIRONMENT={settings.ENVIRONMENT} with "
+            f"{len(problems)} unsafe setting(s); see the log above."
+        )
+
+    if settings.is_development:
+        if settings.API_AUTH_KEY == "DEV_ONLY_CHANGE_ME":
+            logger.warning(
+                "Running with the built-in development API key. Set API_AUTH_KEY "
+                "before deploying anywhere reachable."
+            )
+        if not settings.llm_configured:
+            logger.warning(
+                "No GEMINI_API_KEY configured -- the market regime, stock ranking and "
+                "report agents will run in deterministic-fallback mode. Output will be "
+                "produced, but none of it is LLM-generated."
+            )
+    logger.info(
+        "%s ready (env=%s, model=%s, llm_configured=%s)",
+        settings.PROJECT_NAME, settings.ENVIRONMENT, settings.GEMINI_MODEL,
+        settings.llm_configured,
+    )
+    yield
+
+
+app = FastAPI(title="AI Wealth Manager Engine", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def get_db():
@@ -35,7 +95,10 @@ def get_db():
 
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
-    if x_api_key != settings.API_AUTH_KEY:
+    # secrets.compare_digest rather than `!=`: `!=` on strings short-circuits
+    # at the first differing byte, which leaks the key one character at a
+    # time to anyone who can measure response latency.
+    if x_api_key is None or not secrets.compare_digest(x_api_key, settings.API_AUTH_KEY):
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header")
 
 
@@ -43,43 +106,54 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
 # Pydantic schemas
 # --------------------------------------------------------------------------
 
+# The risk tolerance string drives position caps, concentration limits and
+# the beta guardrail. Accepting a free-form string meant a typo like
+# "moderate" or "Balanced" silently fell through to every agent's default
+# tier instead of being rejected at the door -- a client could be sized
+# against limits they never agreed to.
+RiskTolerance = Literal["Conservative", "Moderate", "Aggressive"]
+
+
 class HoldingIn(BaseModel):
-    symbol: str
-    quantity: float
-    cost_basis: float = 0.0
+    symbol: str = Field(min_length=1, max_length=12)
+    # Negative quantities would flow straight into portfolio valuation and
+    # produce nonsensical negative concentrations.
+    quantity: float = Field(ge=0)
+    cost_basis: float = Field(default=0.0, ge=0)
 
 
 class ClientCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     email: Optional[str] = None
-    age: int
-    risk_tolerance: str  # "Conservative" | "Moderate" | "Aggressive"
-    time_horizon_years: int
+    age: int = Field(ge=18, le=120)
+    risk_tolerance: RiskTolerance
+    time_horizon_years: int = Field(ge=0, le=100)
     goals: List[str] = []
-    net_worth: float = 0.0
+    net_worth: float = Field(default=0.0, ge=0)
     holdings: List[HoldingIn] = []
 
 
 class ClientUpdate(BaseModel):
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
     email: Optional[str] = None
-    age: Optional[int] = None
-    risk_tolerance: Optional[str] = None
-    time_horizon_years: Optional[int] = None
+    age: Optional[int] = Field(default=None, ge=18, le=120)
+    risk_tolerance: Optional[RiskTolerance] = None
+    time_horizon_years: Optional[int] = Field(default=None, ge=0, le=100)
     goals: Optional[List[str]] = None
-    net_worth: Optional[float] = None
+    net_worth: Optional[float] = Field(default=None, ge=0)
 
 
 class HoldingOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     symbol: str
     quantity: float
     cost_basis: float
 
-    class Config:
-        from_attributes = True
-
 
 class ClientOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     email: Optional[str]
@@ -90,14 +164,50 @@ class ClientOut(BaseModel):
     net_worth: float
     holdings: List[HoldingOut]
 
-    class Config:
-        from_attributes = True
-
 
 class ApprovalDecision(BaseModel):
     approved: bool
     decided_by: Optional[str] = None
     notes: Optional[str] = None
+
+
+# --------------------------------------------------------------------------
+# Operational endpoints
+# --------------------------------------------------------------------------
+
+@app.get("/health")
+def health(db: Session = Depends(get_db)):
+    """Unauthenticated liveness/readiness probe.
+
+    Deliberately outside the API-key dependency so a load balancer or
+    container orchestrator can reach it. Reports whether the LLM layer is
+    actually enabled, because "up but running entirely on deterministic
+    fallbacks" is a state that otherwise looks identical to healthy from the
+    outside -- which is exactly how a dead AI layer goes unnoticed.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        logger.exception("Health check database probe failed")
+        db_ok = False
+
+    status = "ok" if db_ok else "degraded"
+    return {
+        "status": status,
+        "environment": settings.ENVIRONMENT,
+        "database": "ok" if db_ok else "unreachable",
+        "llm_enabled": settings.llm_configured,
+        "llm_model": settings.GEMINI_MODEL if settings.llm_configured else None,
+        "agents": [
+            "portfolio_diagnostics",
+            "market_regime",
+            "stock_research",
+            "suitability",
+            "tax_awareness",
+            "finance_report",
+        ],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -163,7 +273,7 @@ def update_client(client_id: int, req: ClientUpdate, db: Session = Depends(get_d
 
     for field, value in req.model_dump(exclude_unset=True).items():
         setattr(client, field, value)
-    client.updated_at = datetime.utcnow()
+    client.updated_at = utcnow()
     db.commit()
     db.refresh(client)
     return _client_to_out(client, db)
@@ -174,19 +284,49 @@ def update_client(client_id: int, req: ClientUpdate, db: Session = Depends(get_d
 # --------------------------------------------------------------------------
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
+    """Parse an agent's ISO timestamp into a NAIVE UTC datetime.
+
+    Agents emit timezone-aware ISO strings, but the DateTime columns are
+    naive and round-trip as naive. Keeping the aware value here would make
+    every comparison against a stored row false -- which silently defeats the
+    audit-trail dedupe above.
+    """
     if not value:
         return None
-    return datetime.fromisoformat(value)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
-def _persist_audit_trail(db: Session, client_id: int, run_id: str, audit_trail: List[dict]) -> None:
+def _persist_audit_trail(db: Session, client_id: Optional[int], run_id: str, audit_trail: List[dict]) -> None:
+    """Write this run's audit records, skipping any already stored.
+
+    LangGraph's resumed result carries the FULL accumulated audit_trail,
+    including every record from before the approval pause. Persisting it
+    verbatim on resume duplicated every pre-interrupt node in agent_runs --
+    which is a real problem for an audit table whose whole purpose is being a
+    faithful record of what ran. Dedupe on (node_name, started_at), which
+    uniquely identifies a node execution within a run.
+    """
+    existing = {
+        (row.node_name, row.started_at)
+        for row in db.query(AgentRun.node_name, AgentRun.started_at).filter(AgentRun.run_id == run_id)
+    }
+
+    added = 0
     for record in audit_trail:
+        key = (record.get("node_name"), _parse_iso(record.get("started_at")))
+        if key in existing:
+            continue
+        existing.add(key)
+        added += 1
         db.add(
             AgentRun(
                 client_id=client_id,
                 run_id=run_id,
                 node_name=record.get("node_name"),
-                started_at=_parse_iso(record.get("started_at")),
+                started_at=key[1],
                 completed_at=_parse_iso(record.get("completed_at")),
                 output_snapshot={"summary": record.get("summary")},
                 status=record.get("status", "success"),
@@ -194,12 +334,21 @@ def _persist_audit_trail(db: Session, client_id: int, run_id: str, audit_trail: 
             )
         )
     db.commit()
+    logger.info("Persisted %d new audit record(s) for run %s", added, run_id)
 
 
-def _persist_report(db: Session, client_id: int, run_id: str, result: dict) -> Optional[Report]:
+def _persist_report(db: Session, client_id: Optional[int], run_id: str, result: dict) -> Optional[Report]:
     final_report = result.get("final_report")
     if not final_report:
         return None
+
+    # A run produces exactly one report. Approving the same run twice (a
+    # double-clicked button, a retried request) must not create a second
+    # copy -- return the existing one instead.
+    existing = db.query(Report).filter(Report.run_id == run_id).first()
+    if existing is not None:
+        return existing
+
     report = Report(
         client_id=client_id,
         run_id=run_id,
@@ -210,6 +359,8 @@ def _persist_report(db: Session, client_id: int, run_id: str, result: dict) -> O
             "candidate_stocks": result.get("candidate_stocks"),
             "suitability_result": result.get("suitability_result"),
             "tax_assessment": result.get("tax_assessment"),
+            "tax_blocked_recommendations": result.get("tax_blocked_recommendations"),
+            "research_attempts": result.get("research_attempts"),
         },
     )
     db.add(report)
@@ -218,13 +369,22 @@ def _persist_report(db: Session, client_id: int, run_id: str, result: dict) -> O
     return report
 
 
-def _run_response(client_id: int, run_id: str, result: dict, db: Session) -> dict:
+def _run_response(client_id: Optional[int], run_id: str, result: dict, db: Session) -> dict:
     _persist_audit_trail(db, client_id, run_id, result.get("audit_trail", []))
 
     if "__interrupt__" in result:
         interrupt_obj = result["__interrupt__"][0]
-        db.add(Approval(run_id=run_id, notes=str(interrupt_obj.value)))
-        db.commit()
+        # Only open a new approval request if one isn't already outstanding,
+        # so a retried trigger doesn't pile up duplicate pending approvals
+        # against the same run.
+        pending = (
+            db.query(Approval)
+            .filter(Approval.run_id == run_id, Approval.decision.is_(None))
+            .first()
+        )
+        if pending is None:
+            db.add(Approval(run_id=run_id, notes=str(interrupt_obj.value)))
+            db.commit()
         return {
             "run_id": run_id,
             "status": "pending_approval",
@@ -240,7 +400,13 @@ def _run_response(client_id: int, run_id: str, result: dict, db: Session) -> dic
         "candidate_stocks": result.get("candidate_stocks"),
         "suitability_result": result.get("suitability_result"),
         "tax_assessment": result.get("tax_assessment"),
+        "tax_blocked_recommendations": result.get("tax_blocked_recommendations") or [],
+        "research_attempts": result.get("research_attempts", 0),
+        "requires_human_approval": result.get("requires_human_approval", False),
+        "human_approved": result.get("human_approved"),
+        "audit_trail": result.get("audit_trail", []),
         "final_report": result.get("final_report"),
+        "llm_enabled": settings.llm_configured,
         "report_id": report.id if report else None,
     }
 
@@ -253,19 +419,40 @@ def trigger_run(client_id: int, db: Session = Depends(get_db)):
 
     try:
         run = run_client_graph(client_id)
-    except Exception as e:
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        # Don't leak stack traces / connection strings to the caller; the
+        # detail is in the log. A failed graph run is a server-side fault,
+        # not a malformed request, so 500 is the honest status code -- the
+        # previous blanket 400 told clients to fix a request that was fine.
+        logger.exception("Graph run failed for client %s", client_id)
+        raise HTTPException(status_code=500, detail="Analysis run failed; see server logs.")
 
     return _run_response(client_id, run["run_id"], run["result"], db)
 
 
 @app.post("/api/v1/runs/{run_id}/approve", dependencies=[Depends(require_api_key)])
 def approve_run(run_id: str, req: ApprovalDecision, db: Session = Depends(get_db)):
-    approval = db.query(Approval).filter(Approval.run_id == run_id).order_by(Approval.id.desc()).first()
+    approval = (
+        db.query(Approval)
+        .filter(Approval.run_id == run_id, Approval.decision.is_(None))
+        .order_by(Approval.id.desc())
+        .first()
+    )
     if not approval:
+        # Distinguish "never existed" from "already decided" -- resubmitting a
+        # decision for a settled run is a different mistake than typing the
+        # wrong run id, and the previous code silently re-decided settled runs.
+        settled = db.query(Approval).filter(Approval.run_id == run_id).first()
+        if settled is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run {run_id} was already {settled.decision} at {settled.decided_at}.",
+            )
         raise HTTPException(status_code=404, detail="No pending approval for this run_id")
 
-    approval.decided_at = datetime.utcnow()
+    approval.decided_at = utcnow()
     approval.decided_by = req.decided_by
     approval.decision = "approved" if req.approved else "rejected"
     approval.notes = req.notes or approval.notes
@@ -273,8 +460,15 @@ def approve_run(run_id: str, req: ApprovalDecision, db: Session = Depends(get_db
 
     try:
         resumed = resume_client_graph(run_id, approved=req.approved)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Failed to resume run %s", run_id)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not resume this run. Its checkpoint may be missing -- see "
+                "server logs."
+            ),
+        )
 
     agent_run = db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
     client_id = agent_run.client_id if agent_run else None

@@ -74,3 +74,68 @@ def test_wash_sale_seed_scenario_is_still_caught(patched_external_calls):
     tax_assessment = result.get("tax_assessment") or {}
     if any(c["ticker"] == "TSLA" for c in candidates):
         assert "TSLA" in tax_assessment.get("wash_sale_flags", [])
+
+
+def test_a_wash_sale_flag_removes_the_ticker_from_the_final_recommendations(
+    patched_external_calls, monkeypatch
+):
+    """End-to-end proof of the compliance fix.
+
+    Forces Stock Research to propose TSLA -- which the seeded client sold at
+    a loss 15 days ago -- and asserts it does not appear in the final
+    recommendations, with the reason stated. Previously the flag was raised
+    and the ticker was recommended anyway.
+    """
+    import agents.stock_research as stock_research
+
+    _ensure_seeded()
+
+    def only_tsla(state):
+        return {
+            "candidate_stocks": [
+                {
+                    "ticker": "TSLA",
+                    "valuation_metrics": {"pe_ratio": 60.0},
+                    "addresses_flaw": "forced test candidate",
+                    "regime_fit_rationale": "forced test candidate",
+                    "confidence": 0.9,
+                }
+            ],
+            "audit_trail": [
+                {
+                    "node_name": "stock_research",
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "completed_at": "2026-01-01T00:00:01+00:00",
+                    "status": "success",
+                    "summary": "forced single-candidate stub",
+                    "error_detail": None,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(stock_research, "stock_research_node", only_tsla)
+    monkeypatch.setattr(orchestrator, "stock_research_node", only_tsla)
+    orchestrator.reset_workflow()
+    try:
+        run = orchestrator.run_client_graph(1)
+        result = run["result"]
+        if "__interrupt__" in result:
+            result = orchestrator.resume_client_graph(run["run_id"], approved=True)["result"]
+
+        assert "TSLA" in (result.get("tax_assessment") or {}).get("wash_sale_flags", [])
+
+        recommended = [
+            r["ticker"]
+            for r in (result.get("suitability_result") or {}).get("adjusted_recommendations", [])
+        ]
+        assert "TSLA" not in recommended, "a wash-sale-flagged ticker must never be recommended"
+        assert "TSLA" in (result.get("tax_blocked_recommendations") or [])
+
+        violations = (result.get("suitability_result") or {}).get("violations", [])
+        assert any("TSLA" in v and "wash-sale" in v for v in violations)
+
+        # And the client-facing report must say so rather than silently
+        # dropping the name.
+        assert "TSLA" in (result.get("final_report") or "")
+    finally:
+        orchestrator.reset_workflow()
