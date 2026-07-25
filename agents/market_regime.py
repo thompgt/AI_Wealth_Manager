@@ -40,10 +40,13 @@ if _REPO_ROOT not in sys.path:
 import pandas as pd
 from pydantic import BaseModel, Field
 
-from config import settings
+from logging_setup import get_logger
+from services.llm import get_chat_model, invoke_with_retry
 from services.market_data import fetch_historical_prices
 from services.news_service import search_financial_news
 from state import AgentRunRecord, AgentState, MarketRegime
+
+logger = get_logger(__name__)
 
 NODE_NAME = "market_regime"
 
@@ -245,19 +248,17 @@ def _invoke_llm(supporting_signals: Dict[str, Any], news_items: List[Dict[str, s
     """
     Raises on any failure -- caller is responsible for the fallback.
     """
-    from langchain_google_genai import ChatGoogleGenerativeAI
-
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-pro",
-        google_api_key=settings.GEMINI_API_KEY,
-        temperature=0.0,
-    )
+    # temperature=0.0: a regime call that gates client recommendations should
+    # be reproducible from the same evidence.
+    llm = get_chat_model(temperature=0.0)
 
     prompt = _build_prompt(supporting_signals, news_items)
 
     try:
         structured_llm = llm.with_structured_output(RegimeAssessment)
-        result = structured_llm.invoke(prompt)
+        result = invoke_with_retry(
+            lambda: structured_llm.invoke(prompt), what="Market Regime assessment"
+        )
         if isinstance(result, RegimeAssessment):
             assessment = result
         else:
@@ -265,7 +266,7 @@ def _invoke_llm(supporting_signals: Dict[str, Any], news_items: List[Dict[str, s
     except Exception:
         # Fall back to manual JSON parsing in case with_structured_output
         # isn't well-supported for this model/version combo.
-        raw = llm.invoke(prompt)
+        raw = invoke_with_retry(lambda: llm.invoke(prompt), what="Market Regime assessment (raw)")
         text = getattr(raw, "content", str(raw))
         text = text.strip()
         if text.startswith("```"):
@@ -287,7 +288,7 @@ def _invoke_llm(supporting_signals: Dict[str, Any], news_items: List[Dict[str, s
 
 def market_regime_node(state: AgentState) -> dict:
     started_at = datetime.now(timezone.utc).isoformat()
-    print(">>> [Market Regime] Fetching indicator basket + macro news...")
+    logger.info(">>> [Market Regime] Fetching indicator basket + macro news...")
 
     supporting_signals: Dict[str, Any] = {}
 
@@ -324,11 +325,14 @@ def market_regime_node(state: AgentState) -> dict:
             "narrative": assessment.narrative,
         }
         summary = f"Regime={assessment.regime_label} (confidence={assessment.confidence:.2f})"
-        print(f"    [Market Regime] {summary}")
+        logger.info("    [Market Regime] %s", summary)
     except Exception as llm_exc:
         status = "error"
         error_detail = f"{type(llm_exc).__name__}: {llm_exc}"
-        print(f"    [Market Regime] LLM synthesis failed, falling back to safe default: {error_detail}")
+        logger.warning(
+            "    [Market Regime] LLM synthesis failed, falling back to safe default: %s",
+            error_detail,
+        )
         market_regime = {
             "regime_label": "Volatile",
             "confidence": 0.0,

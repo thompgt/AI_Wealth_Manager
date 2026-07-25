@@ -30,28 +30,30 @@ if _REPO_ROOT not in sys.path:
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from pypfopt import expected_returns, risk_models
 
+from agents.limits import (
+    DEFAULT_POSITION_CAP as DEFAULT_CONCENTRATION_LIMIT,
+)
+from agents.limits import (
+    RISK_TIER_POSITION_CAP as CONCENTRATION_LIMITS,
+)
+from agents.limits import position_cap_fraction
 from config import settings
-from services.market_data import fetch_historical_prices
+from logging_setup import get_logger
+from services.market_data import fetch_historical_prices, get_ticker_info
 from state import AgentRunRecord, AgentState, ClientProfile, PortfolioDiagnostics
 
-# --------------------------------------------------------------------------
-# Thresholds (documented, not magic numbers). Concentration limits are
-# intentionally kept in lockstep with the Suitability guardrail agent, which
-# reuses these exact percentages for its own hard-stop checks.
-# --------------------------------------------------------------------------
+logger = get_logger(__name__)
 
-# Single non-cash position, as a fraction of net worth, above which we flag
-# excessive concentration risk. Scaled to how much volatility the client has
-# said they can tolerate.
-CONCENTRATION_LIMITS: Dict[str, float] = {
-    "Conservative": 0.15,
-    "Moderate": 0.25,
-    "Aggressive": 0.35,
-}
-DEFAULT_CONCENTRATION_LIMIT = CONCENTRATION_LIMITS["Moderate"]
+# --------------------------------------------------------------------------
+# Thresholds (documented, not magic numbers).
+#
+# The single-position concentration limit is imported from agents/limits.py
+# rather than redeclared here, so it cannot drift from the identical cap the
+# Suitability guardrail enforces -- and, critically, so both agents measure
+# it against the same denominator. See that module.
+# --------------------------------------------------------------------------
 
 # Cash allocations above this fraction of net worth are "cash drag" for
 # clients who said they want growth (Moderate/Aggressive) -- sitting in cash
@@ -95,7 +97,7 @@ def _compute_concentration(holdings: Dict[str, float], total_value: float) -> Di
 
 
 def _concentration_flaws(concentration: Dict[str, float], risk_tolerance: str) -> List[str]:
-    limit = CONCENTRATION_LIMITS.get(risk_tolerance, DEFAULT_CONCENTRATION_LIMIT)
+    limit = position_cap_fraction(risk_tolerance)
     flaws = []
     for symbol, frac in concentration.items():
         if symbol == "CASH":
@@ -140,12 +142,8 @@ def _fetch_sector_exposure(non_cash_holdings: Dict[str, float]) -> Dict[str, flo
 
     sector_values: Dict[str, float] = {}
     for symbol, value in non_cash_holdings.items():
-        sector = "Unknown"
-        try:
-            info = yf.Ticker(symbol).info
-            sector = info.get("sector") or "Unknown"
-        except Exception:
-            sector = "Unknown"
+        info = get_ticker_info(symbol) or {}
+        sector = info.get("sector") or "Unknown"
         sector_values[sector] = sector_values.get(sector, 0.0) + value
 
     return {sector: value / non_cash_total for sector, value in sector_values.items()}

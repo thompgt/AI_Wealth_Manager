@@ -31,9 +31,8 @@ AgentState after a run completes.
 """
 
 import uuid
-from typing import Dict, Literal
+from typing import Dict, List, Literal
 
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -43,11 +42,15 @@ from agents.market_regime import market_regime_node
 from agents.stock_research import stock_research_node
 from agents.suitability import suitability_node
 from agents.tax_awareness import tax_awareness_node
+from checkpointer import get_checkpointer
 from db import ClientProfile as ClientProfileModel
 from db import Holding, SessionLocal
+from logging_setup import get_logger
 from services.market_data import get_current_prices
 from state import AgentState
 from state import ClientProfile as ClientProfileState
+
+logger = get_logger(__name__)
 
 MAX_RESEARCH_ATTEMPTS = 3
 LOW_CONFIDENCE_THRESHOLD = 0.3
@@ -55,18 +58,107 @@ LOW_CONFIDENCE_THRESHOLD = 0.3
 
 def guardrail_gate_node(state: AgentState) -> dict:
     """
-    Fan-in point for suitability + tax_awareness. Decides whether Stock
-    Research needs another pass (suitability rejected everything and we
-    haven't hit the retry cap) or whether the run can proceed to the
-    Finance Report agent.
+    Fan-in point for suitability + tax_awareness, and the single place where
+    the two guardrails are reconciled into one decision.
+
+    Three jobs:
+
+    1.  ENFORCE THE TAX ASSESSMENT. The Tax-Awareness agent runs in parallel
+        with Suitability, so Suitability cannot see its wash-sale flags. Any
+        recommendation that cleared suitability but is wash-sale flagged is
+        stripped here. Previously nothing in the system consumed
+        `wash_sale_flags` at all: the agent computed them, wrote them to
+        state, the report printed them -- and the flagged ticker was still
+        recommended with a dollar figure next to it. That is precisely the
+        violation the check exists to prevent.
+
+    2.  ACCUMULATE RETRY FEEDBACK. Every ticker rejected by either guardrail
+        is added to `excluded_tickers`, and the human-readable reason to
+        `guardrail_feedback`. Stock Research consumes both on its next pass.
+        Without this the retry edge is decorative -- Stock Research would
+        screen the same universe with the same inputs and return the same
+        rejected names, three times over.
+
+    3.  ROUTE. Retry while we still have budget and nothing has been
+        approved; otherwise proceed to the report.
+
+    Note on sizing after a tax block: the removed candidate's dollars are NOT
+    silently reassigned to the survivors. Re-sizing is Suitability's job and
+    only it knows the position caps, so a blocked ticker either gets replaced
+    on a retry pass (which re-runs sizing properly) or the run simply deploys
+    less cash. Under-deploying is the safe direction to fail.
     """
-    suitability = state.get("suitability_result") or {}
-    approved = suitability.get("approved", False)
+    suitability = dict(state.get("suitability_result") or {})
+    tax = state.get("tax_assessment") or {}
     attempts = state.get("research_attempts", 0)
 
+    excluded: List[str] = list(state.get("excluded_tickers") or [])
+    feedback: List[str] = list(state.get("guardrail_feedback") or [])
+
+    recommendations = list(suitability.get("adjusted_recommendations") or [])
+    wash_sale_flags = set(tax.get("wash_sale_flags") or [])
+
+    # --- 1. Tax enforcement ------------------------------------------------
+    surviving = []
+    tax_blocked: List[str] = []
+    for rec in recommendations:
+        ticker = rec.get("ticker")
+        if ticker in wash_sale_flags:
+            tax_blocked.append(ticker)
+            reason = (
+                f"{ticker}: blocked by the Tax-Awareness agent -- repurchasing it now "
+                f"would be a wash-sale violation, disallowing the loss on the recent sale."
+            )
+            logger.info("[Guardrail Gate] TAX-BLOCKED %s", ticker)
+            suitability.setdefault("violations", [])
+            suitability["violations"] = list(suitability["violations"]) + [reason]
+            feedback.append(reason)
+        else:
+            surviving.append(rec)
+
+    suitability["adjusted_recommendations"] = surviving
+    suitability["approved"] = len(surviving) > 0
+
+    # --- 2. Accumulate exclusions for the retry pass -----------------------
+    for ticker in tax_blocked:
+        if ticker not in excluded:
+            excluded.append(ticker)
+    for violation in state.get("suitability_result", {}).get("violations", []) or []:
+        # Violation strings are formatted "TICKER: rejected -- ..." by the
+        # suitability agent; the leading token is the ticker to exclude.
+        ticker = violation.split(":", 1)[0].strip()
+        if ticker and " " not in ticker and ticker not in excluded:
+            excluded.append(ticker)
+        if violation not in feedback:
+            feedback.append(violation)
+
+    approved = suitability["approved"]
+
+    # --- 3. Route ----------------------------------------------------------
+    update = {
+        "suitability_result": suitability,
+        "tax_blocked_recommendations": tax_blocked,
+        "excluded_tickers": excluded,
+        "guardrail_feedback": feedback,
+    }
+
     if approved or attempts >= MAX_RESEARCH_ATTEMPTS:
-        return {"needs_research_retry": False}
-    return {"research_attempts": attempts + 1, "needs_research_retry": True}
+        if not approved:
+            logger.warning(
+                "[Guardrail Gate] No candidate survived after %d research attempt(s); "
+                "proceeding to report with zero recommendations.", attempts,
+            )
+        update["needs_research_retry"] = False
+        return update
+
+    logger.info(
+        "[Guardrail Gate] Nothing approved; sending Stock Research back for attempt %d/%d, "
+        "excluding %s",
+        attempts + 1, MAX_RESEARCH_ATTEMPTS, excluded,
+    )
+    update["research_attempts"] = attempts + 1
+    update["needs_research_retry"] = True
+    return update
 
 
 def route_after_guardrails(state: AgentState) -> Literal["retry", "proceed"]:
@@ -77,26 +169,39 @@ def approval_gate_node(state: AgentState) -> dict:
     """
     Human-in-the-loop gate. Triggers a real LangGraph interrupt() when:
       - Market Regime's confidence is below LOW_CONFIDENCE_THRESHOLD, or
-      - Suitability never reached approval even after MAX_RESEARCH_ATTEMPTS
+      - No candidate survived the guardrails
     Otherwise the run is auto-approved (informational report, no trade
     execution in this phase) and passes straight through.
     """
     regime = state.get("market_regime") or {}
     suitability = state.get("suitability_result") or {}
+    attempts = state.get("research_attempts", 0)
 
     low_confidence = regime.get("confidence", 0.0) < LOW_CONFIDENCE_THRESHOLD
-    guardrail_exhausted = not suitability.get("approved", False)
+    nothing_approved = not suitability.get("approved", False)
 
-    if not (low_confidence or guardrail_exhausted):
+    if not (low_confidence or nothing_approved):
         return {"requires_human_approval": False, "human_approved": True}
 
-    reason = "low_confidence_regime" if low_confidence else "suitability_exhausted_retries"
+    # Report the reason accurately: "exhausted retries" is only true if we
+    # actually spent them. Reporting a first-pass rejection as an exhausted
+    # retry budget misleads whoever is reviewing the paused run.
+    if low_confidence:
+        reason = "low_confidence_regime"
+    elif attempts >= MAX_RESEARCH_ATTEMPTS:
+        reason = "suitability_exhausted_retries"
+    else:
+        reason = "no_suitable_candidates"
+
+    logger.info("[Approval Gate] Pausing run for human approval: %s", reason)
     decision = interrupt(
         {
             "reason": reason,
             "market_regime": regime,
             "suitability_result": suitability,
             "candidate_stocks": state.get("candidate_stocks"),
+            "tax_assessment": state.get("tax_assessment"),
+            "research_attempts": attempts,
         }
     )
     return {"requires_human_approval": True, "human_approved": bool(decision)}
@@ -143,8 +248,26 @@ def _build_graph() -> StateGraph:
     return workflow
 
 
-_checkpointer = MemorySaver()
-app_workflow = _build_graph().compile(checkpointer=_checkpointer)
+_compiled_workflow = None
+
+
+def get_workflow():
+    """Compile the graph lazily against the durable checkpointer.
+
+    Lazy rather than at import time so that tests (and the demo notebook) can
+    point CHECKPOINT_DB_PATH at a temp location before the first run, and so
+    that merely importing the orchestrator doesn't create files on disk.
+    """
+    global _compiled_workflow
+    if _compiled_workflow is None:
+        _compiled_workflow = _build_graph().compile(checkpointer=get_checkpointer())
+    return _compiled_workflow
+
+
+def reset_workflow() -> None:
+    """Drop the compiled graph so the next call rebinds to a fresh checkpointer."""
+    global _compiled_workflow
+    _compiled_workflow = None
 
 
 def load_client_state(client_id: int) -> AgentState:
@@ -152,6 +275,10 @@ def load_client_state(client_id: int) -> AgentState:
     Client Profile Intake -> initial AgentState. Resolves each Holding's
     quantity into a dollar market value (CASH is already dollar-valued;
     everything else is quantity * current price via services.market_data).
+
+    Symbols with no resolvable price are dropped from the holdings map and
+    logged, rather than being silently valued at $0 -- a $0 valuation would
+    quietly distort every concentration percentage and flaw downstream.
     """
     db = SessionLocal()
     try:
@@ -164,12 +291,23 @@ def load_client_state(client_id: int) -> AgentState:
         prices = get_current_prices(priced_symbols) if priced_symbols else {}
 
         holdings: Dict[str, float] = {}
+        unpriced: List[str] = []
         for h in holding_rows:
             if h.symbol == "CASH":
                 holdings["CASH"] = holdings.get("CASH", 0.0) + h.quantity
             else:
-                price = prices.get(h.symbol, 0.0)
+                price = prices.get(h.symbol)
+                if price is None or price <= 0:
+                    unpriced.append(h.symbol)
+                    continue
                 holdings[h.symbol] = holdings.get(h.symbol, 0.0) + h.quantity * price
+
+        if unpriced:
+            logger.warning(
+                "Client %s holds %s but no current price could be resolved; these positions "
+                "are excluded from this run's analysis rather than valued at $0.",
+                client_id, unpriced,
+            )
 
         client_profile: ClientProfileState = {
             "client_id": client.id,
@@ -195,6 +333,9 @@ def load_client_state(client_id: int) -> AgentState:
             "human_approved": None,
             "research_attempts": 0,
             "needs_research_retry": False,
+            "excluded_tickers": [],
+            "guardrail_feedback": [],
+            "tax_blocked_recommendations": [],
         }
         return initial_state
     finally:
@@ -209,7 +350,8 @@ def run_client_graph(client_id: int) -> dict:
     """
     initial_state = load_client_state(client_id)
     config = {"configurable": {"thread_id": initial_state["run_id"]}}
-    result = app_workflow.invoke(initial_state, config=config)
+    logger.info("Starting graph run %s for client %s", initial_state["run_id"], client_id)
+    result = get_workflow().invoke(initial_state, config=config)
     return {"run_id": initial_state["run_id"], "result": result}
 
 
@@ -218,12 +360,17 @@ def resume_client_graph(run_id: str, approved: bool) -> dict:
     Resumes a run paused at the approval gate.
     """
     config = {"configurable": {"thread_id": run_id}}
-    result = app_workflow.invoke(Command(resume=approved), config=config)
+    logger.info("Resuming run %s with approved=%s", run_id, approved)
+    result = get_workflow().invoke(Command(resume=approved), config=config)
     return {"run_id": run_id, "result": result}
 
 
 if __name__ == "__main__":
     import json
+
+    from logging_setup import configure_logging
+
+    configure_logging()
 
     print("=== Running graph for seeded client_id=1 ===")
     run = run_client_graph(1)

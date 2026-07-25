@@ -17,16 +17,24 @@ list. That's a real constraint on recommendation breadth, called out here
 and in the module's run report.
 """
 
-import operator
+import os
 import statistics
+import sys
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import yfinance as yf
 from pydantic import BaseModel, Field
 
-from config import settings
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from logging_setup import get_logger
+from services.llm import get_chat_model, invoke_with_retry
+from services.market_data import get_ticker_info
 from state import AgentState, AgentRunRecord, Candidate
+
+logger = get_logger(__name__)
 
 NODE_NAME = "stock_research"
 
@@ -112,11 +120,11 @@ def _fetch_universe_fundamentals(tickers: List[str]) -> Dict[str, Dict[str, Any]
     """
     fundamentals: Dict[str, Dict[str, Any]] = {}
     for ticker in tickers:
-        try:
-            info = yf.Ticker(ticker).info or {}
-        except Exception as e:
-            print(f"    [Stock Research] yfinance fetch failed for {ticker}: {e}")
-            info = {}
+        # Shared, TTL-cached lookup. Previously each agent fetched `.info`
+        # independently and every research retry refetched the whole
+        # universe from scratch -- ~120 HTTP round trips per run for the same
+        # ~30 symbols, and the dominant source of run latency.
+        info = get_ticker_info(ticker) or {}
 
         raw: Dict[str, Any] = {
             "pe_ratio": info.get("trailingPE"),
@@ -297,20 +305,20 @@ def _llm_rank(
     flaws: List[str],
     client_profile: Dict[str, Any],
     market_regime: Dict[str, Any],
+    guardrail_feedback: Optional[List[str]] = None,
 ) -> List[Candidate]:
     """
     Ask the LLM to pick the top 3-5 from the filtered+cheap candidate set and
     write addresses_flaw / regime_fit_rationale / confidence for each.
     Raises on any failure -- caller is responsible for catching and falling
     back to _deterministic_fallback.
-    """
-    from langchain_google_genai import ChatGoogleGenerativeAI
 
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-pro",
-        google_api_key=settings.GEMINI_API_KEY,
-        temperature=0.2,
-    )
+    On a retry pass, `guardrail_feedback` carries the reasons the downstream
+    compliance and tax agents rejected the previous picks, so the model has a
+    reason to choose differently instead of deterministically reproducing the
+    same rejected list.
+    """
+    llm = get_chat_model(temperature=0.2)
     structured_llm = llm.with_structured_output(RankedCandidateList)
 
     candidate_lines = []
@@ -318,7 +326,18 @@ def _llm_rank(
         d = filtered_fundamentals[ticker]
         candidate_lines.append(f"- {ticker} (sector={d.get('sector')}, metrics={d['metrics']})")
 
+    feedback_block = ""
+    if guardrail_feedback:
+        feedback_block = (
+            "\nPREVIOUS ATTEMPT REJECTED -- the compliance/suitability and tax agents "
+            "rejected your earlier picks for these reasons. Those tickers have already "
+            "been removed from the list above. Do not repeat the same kind of mistake:\n"
+            + "\n".join(f"- {reason}" for reason in guardrail_feedback)
+            + "\n"
+        )
+
     prompt = f"""You are the Stock Research Agent inside a multi-agent wealth-management system.
+{feedback_block}
 
 Client profile:
 - risk_tolerance: {client_profile.get('risk_tolerance')}
@@ -345,7 +364,9 @@ risk profile and the current market regime. For each pick, set:
 - confidence: your confidence in this recommendation, 0 to 1
 """
 
-    result = structured_llm.invoke(prompt)
+    result = invoke_with_retry(
+        lambda: structured_llm.invoke(prompt), what="Stock Research ranking"
+    )
     picks = result.picks if isinstance(result, RankedCandidateList) else result["picks"]
 
     candidates: List[Candidate] = []
@@ -375,45 +396,102 @@ risk profile and the current market regime. For each pick, set:
 
 def stock_research_node(state: AgentState) -> dict:
     started_at = datetime.now(timezone.utc).isoformat()
-    print(">>> [Stock Research] Screening candidate universe against diagnosed flaws...")
+    attempt = state.get("research_attempts", 0) + 1
+    logger.info(
+        ">>> [Stock Research] Screening candidate universe against diagnosed flaws "
+        "(attempt %d)...", attempt,
+    )
 
     diagnostics = state.get("portfolio_diagnostics") or {}
     flaws: List[str] = diagnostics.get("flaws", []) or []
     client_profile = state.get("client_profile") or {}
     market_regime = state.get("market_regime") or {}
 
+    # Retry feedback from the guardrail gate. On the first pass both are
+    # empty; on a retry these are what make the second pass differ from the
+    # first. Without them the retry edge just re-derives the same answer.
+    excluded: set = set(state.get("excluded_tickers") or [])
+    guardrail_feedback: List[str] = list(state.get("guardrail_feedback") or [])
+
     fundamentals = _fetch_universe_fundamentals(CANDIDATE_UNIVERSE)
     have_data = {t: d for t, d in fundamentals.items() if d["metrics"]}
-    print(f"    [Stock Research] Fetched fundamentals for {len(have_data)}/{len(CANDIDATE_UNIVERSE)} tickers")
+    logger.info(
+        "    [Stock Research] Fetched fundamentals for %d/%d tickers",
+        len(have_data), len(CANDIDATE_UNIVERSE),
+    )
+
+    if excluded:
+        before = len(have_data)
+        have_data = {t: d for t, d in have_data.items() if t not in excluded}
+        logger.info(
+            "    [Stock Research] Excluding %d previously-rejected ticker(s) %s (%d -> %d)",
+            before - len(have_data), sorted(excluded), before, len(have_data),
+        )
 
     filtered_by_flaws = _filter_by_flaws(have_data, flaws, client_profile)
-    print(f"    [Stock Research] After flaw/risk filtering: {sorted(filtered_by_flaws.keys())}")
+    logger.info(
+        "    [Stock Research] After flaw/risk filtering: %s", sorted(filtered_by_flaws.keys())
+    )
 
     cheap_tickers = _filter_by_cheapness(filtered_by_flaws)
-    print(f"    [Stock Research] After cheapness filtering: {sorted(cheap_tickers)}")
+    logger.info("    [Stock Research] After cheapness filtering: %s", sorted(cheap_tickers))
 
     status = "success"
     error_detail: Optional[str] = None
-    llm_used = False
 
     if not cheap_tickers:
-        # Universe fully filtered out (e.g. no fundamentals data at all) --
-        # relax back to the full fetched universe so we still return something.
-        cheap_tickers = list(have_data.keys()) or list(fundamentals.keys())
-        filtered_by_flaws = have_data or fundamentals
+        # Universe fully filtered out (e.g. no fundamentals data at all, or
+        # everything excluded by prior rejections) -- relax back to whatever
+        # is left that hasn't been explicitly rejected, so we still return
+        # something rather than an empty recommendation set.
+        relaxed = {t: d for t, d in (have_data or fundamentals).items() if t not in excluded}
+        cheap_tickers = list(relaxed.keys())
+        filtered_by_flaws = relaxed
+
+    if not cheap_tickers:
+        summary = (
+            "No candidates remain: every ticker in the curated universe has already been "
+            "rejected by the compliance/tax guardrails on a previous attempt."
+        )
+        logger.warning("    [Stock Research] %s", summary)
+        return {
+            "candidate_stocks": [],
+            "audit_trail": [
+                AgentRunRecord(
+                    node_name=NODE_NAME,
+                    started_at=started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    status="success",
+                    summary=summary,
+                    error_detail=None,
+                )
+            ],
+        }
 
     try:
-        candidates = _llm_rank(filtered_by_flaws, cheap_tickers, flaws, client_profile, market_regime)
-        llm_used = True
-        summary = f"LLM-ranked {len(candidates)} candidates from a flaw/cheapness-filtered pool of {len(cheap_tickers)}."
+        candidates = _llm_rank(
+            filtered_by_flaws, cheap_tickers, flaws, client_profile, market_regime,
+            guardrail_feedback=guardrail_feedback,
+        )
+        summary = (
+            f"LLM-ranked {len(candidates)} candidates from a flaw/cheapness-filtered pool "
+            f"of {len(cheap_tickers)} (attempt {attempt})."
+        )
     except Exception as e:
         status = "error"
         error_detail = f"LLM ranking failed, used deterministic fallback: {e}"
-        print(f"    [Stock Research] {error_detail}")
+        logger.warning("    [Stock Research] %s", error_detail)
         candidates = _deterministic_fallback(filtered_by_flaws, cheap_tickers, flaws, market_regime)
-        summary = f"LLM ranking failed; deterministic fallback selected {len(candidates)} candidates by relative valuation."
+        summary = (
+            f"LLM ranking failed; deterministic fallback selected {len(candidates)} "
+            f"candidates by relative valuation (attempt {attempt})."
+        )
 
-    print(f"    [Stock Research] Final candidates: {[c['ticker'] for c in candidates]}")
+    # Belt-and-braces: never emit an excluded ticker even if the ranking step
+    # somehow surfaced one. This is the last point before the guardrails.
+    candidates = [c for c in candidates if c["ticker"] not in excluded]
+
+    logger.info("    [Stock Research] Final candidates: %s", [c["ticker"] for c in candidates])
 
     audit_record = AgentRunRecord(
         node_name=NODE_NAME,

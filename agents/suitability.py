@@ -34,8 +34,6 @@ import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-import yfinance as yf
-
 # When this file is run directly (`python agents/suitability.py`), Python
 # puts only this file's own directory (agents/) on sys.path, not the repo
 # root -- so the root-level `state.py` wouldn't be importable. Insert the
@@ -43,19 +41,23 @@ import yfinance as yf
 # package imports (`from agents.suitability import suitability_node`) work.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from logging_setup import get_logger
+from services.market_data import get_ticker_info
 from state import AgentRunRecord, AgentState, Candidate, SuitabilityResult
 
+logger = get_logger(__name__)
+
 # --- Rule 2 thresholds -------------------------------------------------------
-# Risk-tier position-limit caps, expressed as the max fraction of net worth
-# allowed in a single position. These EXACT numbers must match the thresholds
-# used by the (separately-built) Portfolio Diagnostics agent so the two
-# agents tell the client a consistent story.
-RISK_TIER_POSITION_CAP = {
-    "Conservative": 0.15,
-    "Moderate": 0.25,
-    "Aggressive": 0.35,
-}
-DEFAULT_POSITION_CAP = 0.25  # fallback if risk_tolerance is an unrecognized value
+# Risk-tier position caps and the portfolio base they are measured against
+# both live in agents/limits.py, shared with the Portfolio Diagnostics agent.
+# See that module for why the denominator had to be unified, not just the
+# percentages.
+from agents.limits import (  # noqa: E402 -- after the sys.path bootstrap above
+    DEFAULT_POSITION_CAP,
+    RISK_TIER_POSITION_CAP,
+    portfolio_base_value,
+    position_cap_fraction,
+)
 
 # --- Rule 1 thresholds --------------------------------------------------------
 MIN_MARKET_CAP = 2_000_000_000  # $2B small-cap/microcap threshold
@@ -85,17 +87,12 @@ MAX_BETA_NEAR_RETIREMENT = 1.5
 def _fetch_info(ticker: str) -> Optional[Dict[str, Any]]:
     """Best-effort fetch of yfinance's `.info` dict for a ticker.
 
-    Returns None on any failure (network error, delisted ticker, empty
-    response, unexpected shape, etc.) so callers can treat "couldn't verify"
-    as its own explicit case instead of crashing the whole node.
+    Delegates to the shared, TTL-cached lookup in services.market_data so
+    that a symbol already screened by Stock Research this run is not fetched
+    over the network a second time. Returns None on any failure so callers
+    can treat "couldn't verify" as its own explicit case.
     """
-    try:
-        info = yf.Ticker(ticker).info
-        if not info or not isinstance(info, dict):
-            return None
-        return info
-    except Exception:
-        return None
+    return get_ticker_info(ticker)
 
 
 def _check_security_quality(ticker: str, info: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -143,24 +140,25 @@ def _compute_allocations(
     Available CASH is distributed across candidates weighted by each
     candidate's confidence score (equal-weighted if every confidence is 0),
     with each ticker capped at the client's risk-tier position limit (as a
-    fraction of net worth, net of any existing holding in that symbol). Cash
-    that would overflow a capped-out ticker is redistributed across the
-    remaining open tickers in further passes (simple water-filling), so
-    available cash gets used even when confidence is skewed toward a name
-    that's already near its cap.
+    fraction of the managed portfolio's value, net of any existing holding in
+    that symbol). Cash that would overflow a capped-out ticker is
+    redistributed across the remaining open tickers in further passes (simple
+    water-filling), so available cash gets used even when confidence is
+    skewed toward a name that's already near its cap.
     """
-    net_worth = client_profile.get("net_worth", 0.0)
     holdings = client_profile.get("holdings", {})
     available_cash = holdings.get("CASH", 0.0)
-    risk_tolerance = client_profile.get("risk_tolerance", "Moderate")
-    cap_fraction = RISK_TIER_POSITION_CAP.get(risk_tolerance, DEFAULT_POSITION_CAP)
+    # Measured against the same base Portfolio Diagnostics uses for its
+    # concentration flaws -- see agents/limits.py.
+    base_value = portfolio_base_value(client_profile)
+    cap_fraction = position_cap_fraction(client_profile.get("risk_tolerance", "Moderate"))
 
     tickers = [c["ticker"] for c in candidates]
     allocation = {t: 0.0 for t in tickers}
-    if not tickers or available_cash <= 0 or net_worth <= 0:
+    if not tickers or available_cash <= 0 or base_value <= 0:
         return allocation
 
-    cap_dollar = cap_fraction * net_worth
+    cap_dollar = cap_fraction * base_value
     max_amount = {t: max(0.0, cap_dollar - holdings.get(t, 0.0)) for t in tickers}
 
     confidences = {c["ticker"]: max(c.get("confidence", 0.0), 0.0) for c in candidates}
@@ -243,7 +241,7 @@ def suitability_node(state: AgentState) -> dict:
     is `Annotated[..., operator.add]` and LangGraph concatenates it.
     """
     started_at = datetime.now(timezone.utc).isoformat()
-    print(">>> [Suitability/Compliance Guardrail] Evaluating candidates against client profile...")
+    logger.info(">>> [Suitability/Compliance Guardrail] Evaluating candidates against client profile...")
 
     candidates: List[Candidate] = state.get("candidate_stocks") or []
     client_profile = state["client_profile"]
@@ -267,12 +265,12 @@ def suitability_node(state: AgentState) -> dict:
                 reason = _check_age_horizon_volatility(ticker, info, client_profile)
 
             if reason is not None:
-                print(f"    [Suitability] REJECTED {ticker}: {reason}")
+                logger.info("    [Suitability] REJECTED %s: %s", ticker, reason)
                 violations.append(reason)
             else:
                 quality_passed.append(candidate)
 
-        net_worth = client_profile.get("net_worth", 0.0)
+        base_value = portfolio_base_value(client_profile)
         allocations = _compute_allocations(quality_passed, client_profile)
 
         adjusted_recommendations: List[Candidate] = []
@@ -280,18 +278,18 @@ def suitability_node(state: AgentState) -> dict:
             ticker = candidate["ticker"]
             amount = allocations.get(ticker, 0.0)
             if amount < MIN_ALLOCATION_DOLLARS:
-                print(f"    [Suitability] REJECTED {ticker}: no available allocation room")
+                logger.info("    [Suitability] REJECTED %s: no available allocation room", ticker)
                 violations.append(
                     f"{ticker}: rejected -- no meaningful room to add (${amount:,.0f} available) "
                     f"after risk-tier position caps and existing holdings were applied."
                 )
                 continue
-            print(f"    [Suitability] APPROVED {ticker}: allocating ${amount:,.0f}")
+            logger.info("    [Suitability] APPROVED %s: allocating $%s", ticker, f"{amount:,.0f}")
             adjusted_recommendations.append(
                 {
                     **candidate,
                     "allocation_amount": round(amount, 2),
-                    "allocation_pct": round(amount / net_worth, 4) if net_worth > 0 else 0.0,
+                    "allocation_pct": round(amount / base_value, 4) if base_value > 0 else 0.0,
                 }
             )
 
@@ -308,7 +306,7 @@ def suitability_node(state: AgentState) -> dict:
             f"with a total of ${sum(c['allocation_amount'] for c in adjusted_recommendations):,.0f} "
             f"allocated, {len(violations)} violation(s) recorded."
         )
-        print(f"    [Suitability] {summary}")
+        logger.info("    [Suitability] %s", summary)
 
         record: AgentRunRecord = {
             "node_name": "suitability",
@@ -343,8 +341,14 @@ def suitability_node(state: AgentState) -> dict:
 if __name__ == "__main__":
     import json
 
+    from logging_setup import configure_logging
+
+    configure_logging()
+
     # Realistic sample AgentState for a Conservative client.
-    # net_worth = 50,000; Conservative cap = 15% = $7,500 per single position.
+    # Portfolio base = CASH 5,000 + AAPL 7,500 = $12,500 -- the managed
+    # portfolio value, which is what position caps are measured against (see
+    # agents/limits.py). Conservative cap = 15% = $1,875 per single position.
     #
     # Two candidates, $5,000 available CASH to deploy:
     #   - AAPL: real large-cap, major-exchange ticker that clears the
@@ -422,5 +426,10 @@ if __name__ == "__main__":
     assert "JNJ" in approved_tickers, "expected JNJ to be approved"
     assert any("AAPL" in v and "cap" in v for v in sr["violations"]), "expected AAPL position-limit violation"
     jnj = next(c for c in sr["adjusted_recommendations"] if c["ticker"] == "JNJ")
-    assert jnj["allocation_amount"] == 5000.0, f"expected JNJ to receive all $5,000 cash, got {jnj['allocation_amount']}"
-    print("\nAll assertions passed: clean candidate sized and approved, capped-out position rejected.")
+    # Portfolio base $12,500 x 15% Conservative cap = $1,875 max per position,
+    # so JNJ is capped there rather than taking all $5,000 of available cash.
+    assert jnj["allocation_amount"] == 1875.0, (
+        f"expected JNJ to be capped at $1,875 (15% of the $12,500 portfolio), "
+        f"got {jnj['allocation_amount']}"
+    )
+    print("\nAll assertions passed: clean candidate sized and capped, capped-out position rejected.")

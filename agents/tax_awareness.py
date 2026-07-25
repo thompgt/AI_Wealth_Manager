@@ -29,7 +29,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from db import Holding, SessionLocal, TransactionLog
+from db import Holding, SessionLocal, TransactionLog, utcnow
 from services.market_data import get_current_prices
 from state import AgentRunRecord, AgentState, Candidate, TaxAssessment
 
@@ -55,7 +55,7 @@ def _get_recent_sold_symbols(db, client_id: int) -> Set[str]:
     """Symbols sold by this client within the wash-sale window, using the
     same naive-UTC convention as the rest of the codebase (db.py's
     TransactionLog.timestamp and seed data are naive UTC)."""
-    cutoff = datetime.utcnow() - timedelta(days=WASH_SALE_WINDOW_DAYS)
+    cutoff = utcnow() - timedelta(days=WASH_SALE_WINDOW_DAYS)
     recent_sells = (
         db.query(TransactionLog)
         .filter(

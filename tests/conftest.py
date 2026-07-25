@@ -1,12 +1,39 @@
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-import pandas as pd
-import pytest
+# ---------------------------------------------------------------------------
+# Test isolation.
+#
+# These MUST be set before anything imports `config` or `db`, because db.py
+# builds its SQLAlchemy engine at import time from settings.NEON_DATABASE_URL.
+# conftest.py is imported before any test module, so this is the only place
+# it can happen.
+#
+# Previously the suite ran against ./wealth_manager.db -- the developer's real
+# database. Tests seeded it, wrote agent_runs and reports into it, and their
+# behaviour depended on whatever state a previous manual run had left behind.
+# A test suite that mutates the dev database is both unsafe and
+# non-reproducible.
+# ---------------------------------------------------------------------------
+_TMP_DIR = tempfile.mkdtemp(prefix="wealth-manager-tests-")
+atexit.register(shutil.rmtree, _TMP_DIR, True)
+
+os.environ["NEON_DATABASE_URL"] = "sqlite:///" + os.path.join(_TMP_DIR, "test.db").replace("\\", "/")
+os.environ["CHECKPOINT_DB_PATH"] = os.path.join(_TMP_DIR, "checkpoints.sqlite")
+os.environ["ENVIRONMENT"] = "development"
+os.environ["GEMINI_API_KEY"] = "DUMMY_API_KEY"
+# Keep the backoff loop from adding real wall-clock time to the suite.
+os.environ["LLM_MAX_ATTEMPTS"] = "1"
+
+import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
 
 
 def make_price_frame(tickers, days=130, start_price=100.0, daily_drift=0.001):
@@ -50,14 +77,20 @@ class FakeTicker:
 
 @pytest.fixture
 def fake_yfinance(monkeypatch):
-    """Patches yf.Ticker in every agent module that calls it directly."""
-    import agents.diagnostics as diagnostics
-    import agents.stock_research as stock_research
-    import agents.suitability as suitability
+    """Patch the single place that now talks to yfinance for ticker metadata.
 
-    monkeypatch.setattr(diagnostics.yf, "Ticker", FakeTicker)
-    monkeypatch.setattr(stock_research.yf, "Ticker", FakeTicker)
-    monkeypatch.setattr(suitability.yf, "Ticker", FakeTicker)
+    All three agents used to call `yf.Ticker(...).info` themselves, so this
+    fixture had to patch three module-level `yf` references. They now share
+    services.market_data.get_ticker_info, so there is exactly one seam -- and
+    its in-process cache has to be cleared around each test so a real lookup
+    from another test can't leak in (or a fake one leak out).
+    """
+    import services.market_data as market_data
+
+    market_data.clear_ticker_info_cache()
+    monkeypatch.setattr(market_data.yf, "Ticker", FakeTicker)
+    yield
+    market_data.clear_ticker_info_cache()
 
 
 @pytest.fixture
@@ -84,11 +117,11 @@ def patched_external_calls(monkeypatch, fake_yfinance):
     def fake_get_current_prices(tickers):
         return {t: 250.0 for t in tickers}
 
-    def fake_search_financial_news(keywords, max_results=5):
-        return []
-
     def fail_llm(*args, **kwargs):
         raise RuntimeError("LLM disabled in tests -- exercising the deterministic fallback path")
+
+    def fake_search_financial_news(keywords, max_results=5):
+        return []
 
     monkeypatch.setattr(diagnostics, "fetch_historical_prices", fake_fetch_historical_prices)
     monkeypatch.setattr(market_regime, "fetch_historical_prices", fake_fetch_historical_prices)

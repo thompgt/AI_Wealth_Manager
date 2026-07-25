@@ -40,11 +40,13 @@ def test_security_quality_passes_large_cap_major_exchange():
 
 
 def test_compute_allocations_caps_a_ticker_already_at_its_limit():
-    # Conservative cap = 15% of $50,000 = $7,500; AAPL already holds exactly
-    # that, so it should get $0 of the available $5,000 cash.
+    # Portfolio base = CASH 5,000 + AAPL 40,000 = $45,000.
+    # Conservative cap = 15% = $6,750; AAPL already holds well beyond that,
+    # so it should get $0 of the available $5,000 cash while JNJ (no existing
+    # position, $6,750 of room) absorbs all of it.
     profile = {
         "net_worth": 50000.0,
-        "holdings": {"CASH": 5000.0, "AAPL": 7500.0},
+        "holdings": {"CASH": 5000.0, "AAPL": 40000.0},
         "risk_tolerance": "Conservative",
     }
     allocations = _compute_allocations([_candidate("AAPL"), _candidate("JNJ")], profile)
@@ -52,10 +54,31 @@ def test_compute_allocations_caps_a_ticker_already_at_its_limit():
     assert allocations["JNJ"] == 5000.0
 
 
-def test_compute_allocations_splits_cash_by_confidence():
+def test_compute_allocations_measures_caps_against_the_portfolio_not_net_worth():
+    """Regression guard for the denominator mismatch fixed in agents/limits.py.
+
+    This client's net worth ($1M) is far larger than the portfolio the system
+    actually manages ($10k of cash). Sizing against net worth would permit a
+    35% Aggressive cap of $350,000 per position -- i.e. no cap at all -- and
+    would contradict the concentration percentages Portfolio Diagnostics
+    reports for the very same client. The cap must bind at 35% of $10,000.
+    """
     profile = {
-        "net_worth": 1000000.0,  # cap is high enough that no ticker gets capped out
+        "net_worth": 1000000.0,
         "holdings": {"CASH": 10000.0},
+        "risk_tolerance": "Aggressive",
+    }
+    allocations = _compute_allocations([_candidate("A", confidence=1.0)], profile)
+    assert abs(allocations["A"] - 3500.0) < 1e-6
+
+
+def test_compute_allocations_splits_cash_by_confidence():
+    # Portfolio base = $100,000, Aggressive cap = 35% = $35,000 per name,
+    # high enough that neither ticker caps out and the split is purely by
+    # confidence weight over the $10,000 of available cash.
+    profile = {
+        "net_worth": 100000.0,
+        "holdings": {"CASH": 10000.0, "VTI": 90000.0},
         "risk_tolerance": "Aggressive",
     }
     allocations = _compute_allocations(
@@ -67,8 +90,8 @@ def test_compute_allocations_splits_cash_by_confidence():
 
 def test_compute_allocations_equal_weight_when_all_confidences_zero():
     profile = {
-        "net_worth": 1000000.0,
-        "holdings": {"CASH": 10000.0},
+        "net_worth": 100000.0,
+        "holdings": {"CASH": 10000.0, "VTI": 90000.0},
         "risk_tolerance": "Aggressive",
     }
     allocations = _compute_allocations(

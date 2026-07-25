@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import (
     create_engine,
     Column,
@@ -26,6 +26,17 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+def utcnow() -> datetime:
+    """Naive UTC timestamp for the DateTime columns below.
+
+    These columns are timezone-naive and the existing rows are naive UTC, so
+    the convention has to stay naive. `datetime.utcnow()` is deprecated in
+    Python 3.12+, so we build an aware UTC value and drop the tzinfo rather
+    than keep calling the deprecated function in a dozen places.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class ClientProfile(Base):
     __tablename__ = "client_profiles"
     id = Column(Integer, primary_key=True, index=True)
@@ -38,8 +49,8 @@ class ClientProfile(Base):
     # e.g. ["retirement", "home purchase"]
     goals = Column(JSON, default=list)
     net_worth = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class Holding(Base):
@@ -50,7 +61,7 @@ class Holding(Base):
     # For the CASH pseudo-asset: quantity holds the dollar amount, cost_basis is 1.0
     quantity = Column(Float, default=0.0)
     cost_basis = Column(Float, default=0.0)
-    acquired_at = Column(DateTime, default=datetime.utcnow)
+    acquired_at = Column(DateTime, default=utcnow)
 
 
 class TransactionLog(Base):
@@ -61,7 +72,7 @@ class TransactionLog(Base):
     transaction_type = Column(String)  # "BUY" or "SELL"
     amount = Column(Float)
     price_per_unit = Column(Float)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=utcnow)
 
 
 class AgentRun(Base):
@@ -70,7 +81,7 @@ class AgentRun(Base):
     client_id = Column(Integer, ForeignKey("client_profiles.id"), index=True)
     run_id = Column(String, index=True)  # groups all nodes of one graph execution
     node_name = Column(String)
-    started_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=utcnow)
     completed_at = Column(DateTime, nullable=True)
     input_snapshot = Column(JSON, default=dict)
     output_snapshot = Column(JSON, default=dict)
@@ -84,7 +95,7 @@ class Report(Base):
     id = Column(Integer, primary_key=True, index=True)
     client_id = Column(Integer, ForeignKey("client_profiles.id"), index=True)
     run_id = Column(String, index=True)
-    generated_at = Column(DateTime, default=datetime.utcnow)
+    generated_at = Column(DateTime, default=utcnow)
     report_text = Column(String)
     structured_payload = Column(JSON, default=dict)
     version = Column(Integer, default=1)
@@ -96,14 +107,14 @@ class MarketDataCache(Base):
     ticker = Column(String, index=True)
     as_of_date = Column(DateTime, index=True)
     close_price = Column(Float)
-    fetched_at = Column(DateTime, default=datetime.utcnow)
+    fetched_at = Column(DateTime, default=utcnow)
 
 
 class Approval(Base):
     __tablename__ = "approvals"
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String, index=True)
-    requested_at = Column(DateTime, default=datetime.utcnow)
+    requested_at = Column(DateTime, default=utcnow)
     decided_at = Column(DateTime, nullable=True)
     decided_by = Column(String, nullable=True)
     decision = Column(String, nullable=True)  # approved | rejected
@@ -140,13 +151,13 @@ def seed_db():
     holdings = [
         Holding(client_id=client.id, symbol="CASH", quantity=400000.0, cost_basis=1.0),
         Holding(client_id=client.id, symbol="TSLA", quantity=400.0, cost_basis=250.0,
-                acquired_at=datetime.utcnow() - timedelta(days=200)),
+                acquired_at=utcnow() - timedelta(days=200)),
     ]
     db.add_all(holdings)
 
     # Trade from 15 days ago for wash-sale testing: sold TSLA at a loss.
     # Rule: if sold at a loss within 30 days, cannot buy back the same asset.
-    past_date = datetime.utcnow() - timedelta(days=15)
+    past_date = utcnow() - timedelta(days=15)
     trade = TransactionLog(
         client_id=client.id,
         asset_symbol="TSLA",
