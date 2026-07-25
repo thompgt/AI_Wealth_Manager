@@ -41,6 +41,11 @@ python-dotenv==1.2.2
 # Frontend
 solara==1.60.3
 plotly==6.9.0
+# Required by solara.FigurePlotly: plotly 6 moved FigureWidget onto anywidget,
+# and neither plotly nor solara declares it. Without it the dashboard renders a
+# traceback instead of the results view -- and only on the results view, so a
+# smoke test that stops at the client list never sees it.
+anywidget==0.11.0
 
 # Demo notebook / static chart export
 nbformat==5.10.4

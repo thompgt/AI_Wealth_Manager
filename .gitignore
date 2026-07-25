@@ -5,7 +5,10 @@ __pycache__/
 .env
 *.db
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 checkpoints.sqlite*
+*.log
 .venv/
 venv/
 .ipynb_checkpoints/
