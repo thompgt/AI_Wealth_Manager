@@ -74,8 +74,9 @@ in plain language.
 3. Recommendations -- for each approved candidate, explain what flaw it \
 addresses, why it fits the current market regime, cite its valuation \
 metrics, and state the specific recommended dollar allocation \
-(allocation_amount) and what fraction of net worth it represents \
-(allocation_pct).
+(allocation_amount) and what fraction of the managed portfolio it represents \
+(allocation_pct -- this is a fraction of total portfolio value, NOT of net \
+worth; do not describe it as a share of net worth).
 4. What We Filtered Out and Why -- plainly summarize any suitability \
 violations that caused candidates or actions to be blocked/adjusted, so the \
 client understands the system applies real guardrails rather than blindly \
@@ -216,7 +217,10 @@ def _fallback_recommendations(suitability_result: Dict[str, Any]) -> str:
         confidence_str = _pct(confidence) if isinstance(confidence, (int, float)) else "N/A"
         allocation_amount = c.get("allocation_amount", 0.0)
         allocation_pct = c.get("allocation_pct", 0.0)
-        lines.append(f"- {ticker}: recommended allocation ${allocation_amount:,.0f} ({_pct(allocation_pct)} of net worth, confidence: {confidence_str})")
+        lines.append(
+            f"- {ticker}: recommended allocation ${allocation_amount:,.0f} "
+            f"({_pct(allocation_pct)} of the portfolio, confidence: {confidence_str})"
+        )
         lines.append(f"    Addresses: {addresses}")
         lines.append(f"    Why it fits the current regime: {rationale}")
         lines.append(f"    Valuation metrics: {metrics_str}")

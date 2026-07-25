@@ -230,7 +230,7 @@ def RecommendationsPanel(suitability):
                     {
                         "Ticker": r.get("ticker"),
                         "Allocation ($)": r.get("allocation_amount", 0.0),
-                        "Allocation (%)": r.get("allocation_pct", 0.0) * 100,
+                        "Allocation (% of portfolio)": r.get("allocation_pct", 0.0) * 100,
                         "Addresses Flaw": r.get("addresses_flaw"),
                         "Rationale": r.get("regime_fit_rationale"),
                         "Confidence": r.get("confidence"),
