@@ -106,38 +106,155 @@ reason shown to the client rather than silently dropped:
 
 ## Architecture
 
+Four layers: a Solara dashboard that talks to a FastAPI service over HTTP, a LangGraph
+orchestrator that owns control flow, six agent nodes plus two gate nodes, and a services layer
+that is the only thing allowed to touch the network.
+
+### The graph
+
+`orchestrator.py` compiles a LangGraph `StateGraph` of six agent nodes and two gate nodes.
+Each node is annotated below with whether it calls an LLM and which services it reaches for.
+
+```mermaid
+flowchart TB
+    START(["START"])
+
+    DIAG["<b>diagnostics</b><br/><i>deterministic</i><br/>market data"]
+    REGIME["<b>market_regime</b><br/><i>signals, then LLM</i><br/>market data · news · LLM"]
+    RESEARCH["<b>stock_research</b><br/><i>screen, then LLM</i><br/>market data · LLM"]
+    SUIT["<b>suitability</b><br/><i>rules only — no LLM</i><br/>market data"]
+    TAX["<b>tax_awareness</b><br/><i>rules only — no LLM</i><br/>market data"]
+    GATE{"<b>guardrail_gate</b><br/>reconcile · route"}
+    REPORT["<b>finance_report</b><br/><i>LLM</i>"]
+    APPROVAL{{"<b>approval_gate</b><br/>interrupt() — human in the loop"}}
+    FINISH(["END"])
+
+    START --> DIAG
+    START --> REGIME
+    DIAG --> RESEARCH
+    REGIME --> RESEARCH
+    RESEARCH --> SUIT
+    RESEARCH --> TAX
+    SUIT --> GATE
+    TAX --> GATE
+    GATE -->|proceed| REPORT
+    GATE -. "retry, max 3<br/>nothing survived" .-> RESEARCH
+    REPORT --> APPROVAL
+    APPROVAL --> FINISH
+
+    P1["parallel superstep 1<br/>no data dependency"] -.- DIAG
+    P2["parallel superstep 2<br/>neither sees the other"] -.- SUIT
+
+    classDef par fill:#fff,stroke:#bbb,stroke-dasharray:3 3,color:#666,font-size:11px
+    classDef noLLM stroke-width:3px
+    class P1,P2 par
+    class SUIT,TAX,DIAG noLLM
 ```
-             ┌──────────────────────┐   ┌──────────────────┐
-   START ───▶│ Portfolio Diagnostics│   │  Market Regime   │◀─── START
-             │   (deterministic)    │   │  (hybrid + LLM)  │
-             └──────────┬───────────┘   └────────┬─────────┘
-                        └───────────┬────────────┘
-                                    ▼
-                          ┌───────────────────┐
-                     ┌───▶│  Stock Research   │
-                     │    │  (screen + LLM)   │
-                     │    └─────────┬─────────┘
-                     │       ┌──────┴──────┐
-                     │       ▼             ▼
-                     │ ┌───────────┐ ┌──────────────┐
-                     │ │Suitability│ │Tax-Awareness │
-                     │ │ (rules)   │ │ (wash-sale)  │
-                     │ └─────┬─────┘ └──────┬───────┘
-                     │       └──────┬───────┘
-                     │              ▼
-                     │     ┌─────────────────┐
-                     └─────┤  Guardrail Gate │   retry (≤3) if nothing survives
-                    retry  └────────┬────────┘
-                                    ▼ proceed
-                          ┌───────────────────┐
-                          │  Finance Report   │
-                          └─────────┬─────────┘
-                                    ▼
-                          ┌───────────────────┐
-                          │   Approval Gate   │  ← human-in-the-loop interrupt
-                          └─────────┬─────────┘
-                                    ▼ END
+
+`GATE -->|proceed|` and the dotted `retry` edge are the graph's single conditional edge,
+decided by `route_after_guardrails`. Every other edge is unconditional.
+`diagnostics`/`market_regime` and `suitability`/`tax_awareness` are genuine parallel pairs —
+LangGraph runs each pair in one superstep, which is why `audit_trail` is annotated with
+`operator.add` rather than overwritten. Nodes drawn with a heavy border make no LLM call at
+all.
+
+### The layers around it
+
+```mermaid
+flowchart LR
+    subgraph UI["Serving"]
+        direction TB
+        SOLARA["app.py<br/>Solara :8765"]
+        API["server.py<br/>FastAPI :8000"]
+        SOLARA -->|"HTTP + X-API-Key"| API
+    end
+
+    subgraph CORE["Orchestration"]
+        direction TB
+        ORCH["orchestrator.py<br/>StateGraph + gates"]
+        AGENTS["agents/<br/>6 agent nodes<br/>+ shared limits.py"]
+        ORCH --> AGENTS
+    end
+
+    subgraph SVC["services/ — the only network callers"]
+        direction TB
+        MKT["market_data.py<br/>yfinance + TTL cache"]
+        LLMSVC["llm.py<br/>Gemini + retry/backoff"]
+        NEWS["news_service.py<br/>DuckDuckGo, best-effort"]
+    end
+
+    subgraph PERSIST["Persistence"]
+        direction TB
+        STATE[("state.py — AgentState<br/>in-flight, between nodes")]
+        CKPT[("checkpointer.py<br/>Postgres → SQLite → memory")]
+        DB[("db.py — SQLAlchemy<br/>clients · holdings · transactions<br/>agent_runs · reports · price cache")]
+    end
+
+    API -->|"run / approve"| ORCH
+    API -->|"persist audit trail + report"| DB
+    AGENTS --> SVC
+    ORCH <-->|"read + write"| STATE
+    ORCH -->|"checkpoint every superstep"| CKPT
+    MKT <-->|"price cache"| DB
 ```
+
+The dashboard holds no business logic — it is an HTTP client of the API, including the
+approval round trip. Agents never call the network directly; everything goes through
+`services/`, which is what makes the whole suite runnable with no network and no API key.
+
+### One request, end to end
+
+1. **`POST /api/v1/clients/{id}/run`** authenticates the `X-API-Key` header and calls
+   `run_client_graph`.
+2. **`load_client_state`** reads the client profile, holdings, and transaction log from SQLite,
+   resolves every non-`CASH` symbol to a live price via `services/market_data`, and builds the
+   initial `AgentState` with a fresh `run_id` (which is also the LangGraph `thread_id`).
+3. **Superstep 1** runs `diagnostics` and `market_regime` in parallel. Diagnostics values the
+   holdings, computes concentration/sector/Sharpe against *this client's* risk tier, and emits
+   plain-language flaws. Market Regime computes trend signals from 12 macro tickers and 5 ratio
+   pairs, pulls best-effort news, and asks the LLM to classify the regime grounded in those
+   signals — falling back to `Volatile`/confidence 0.0 if the LLM is unavailable.
+4. **`stock_research`** screens the 34-name `CANDIDATE_UNIVERSE`, driven by the diagnosed
+   flaws and the regime, skipping anything in `excluded_tickers`. Each candidate must name the
+   flaw it addresses.
+5. **Superstep 2** runs `suitability` and `tax_awareness` in parallel. Neither sees the other.
+   Suitability applies quality, beta, and position-cap rules and then *sizes* the survivors
+   from available cash by confidence weight. Tax-Awareness independently flags 30-day
+   wash-sale repurchases against the transaction log.
+6. **`guardrail_gate`** is the fan-in and the only place the two verdicts meet. It strips
+   wash-sale-flagged recommendations, appends the reason to the client-visible violations,
+   accumulates `excluded_tickers` + `guardrail_feedback`, and routes: back to `stock_research`
+   if nothing survived and fewer than 3 attempts have been spent, otherwise forward.
+7. **`finance_report`** synthesises a six-section report under strict grounding rules, with a
+   deterministic template fallback.
+8. **`approval_gate`** calls `interrupt()` if regime confidence is below 0.3 or nothing was
+   approved. The checkpointer writes the paused state durably and the HTTP call returns a
+   pending-approval response — the process can restart without losing the run.
+9. **`POST /api/v1/runs/{run_id}/approve`** resumes with `Command(resume=approved)` against the
+   same `thread_id`. On completion, `server.py` persists the audit trail to `agent_runs` and
+   the structured payload plus prose to `reports`.
+
+### Module responsibilities
+
+| Module | Responsibility |
+|---|---|
+| `orchestrator.py` | Builds and compiles the `StateGraph`, owns the guardrail gate, the approval gate, the conditional retry edge, and client-state loading. Control flow only — it never writes to the app database. |
+| `state.py` | The `AgentState` TypedDict and every payload schema passed between nodes. `audit_trail` uses `operator.add` so parallel branches concatenate instead of clobbering. |
+| `checkpointer.py` | Selects a durable checkpointer — Postgres if the app points at Postgres, else SQLite, else in-memory with a loud warning. This is what carries a paused run across the resume request. |
+| `config.py` | Pydantic settings plus environment safety validation; refuses to start outside `development` with placeholder keys or SQLite behind multiple workers. |
+| `db.py` | SQLAlchemy models — `client_profiles`, `holdings`, `transaction_logs`, `agent_runs`, `reports`, `market_data_cache`, `approvals` — plus init and dev seed. |
+| `server.py` | FastAPI app: API-key auth, client CRUD, run/approve endpoints, `/health`, and persistence of the audit trail and report after each run. |
+| `app.py` | Solara dashboard. Holds no business logic — it is an HTTP client of `server.py`, including the approval round trip. |
+| `agents/diagnostics.py` | Valuation, concentration, sector exposure, Sharpe/return/volatility via PyPortfolioOpt, scored against the client's risk tier. |
+| `agents/market_regime.py` | Deterministic macro trend signals, then LLM classification grounded in them. Fail-safe to `Volatile`/0.0. |
+| `agents/stock_research.py` | Flaw-driven screen over `CANDIDATE_UNIVERSE`, relative-valuation filter, ranking, and consumption of retry feedback. |
+| `agents/suitability.py` | Security-quality, beta, and position-cap rules; then dollar sizing by confidence weight, water-filling around each cap. No LLM. |
+| `agents/tax_awareness.py` | 30-day wash-sale check against the transaction log; embedded gain/loss notes. No LLM. |
+| `agents/finance_report.py` | Six-section client report under grounding rules, with a deterministic template fallback. |
+| `agents/limits.py` | Shared risk-tier limits used by diagnostics and suitability, so both score against the same numbers. |
+| `services/market_data.py` | yfinance access behind a DB-backed price cache and a process-level ticker-info TTL cache. |
+| `services/llm.py` | Single Gemini client factory plus `invoke_with_retry`; classifies transient vs permanent failures so agents drop to fallback immediately when retrying cannot help. |
+| `services/news_service.py` | Best-effort DuckDuckGo news for regime context. Returns `[]` on any failure — supplementary, never ground truth. |
 
 | Agent | LLM? | What it does |
 |---|---|---|
@@ -160,6 +277,36 @@ Suitability can approve and size a position that Tax-Awareness is simultaneously
 recommendations, records why in the client-visible violations, and — if nothing survives —
 sends Stock Research back for another pass with the rejected tickers excluded and the reasons
 attached to the prompt.
+
+This is the withholding path that produces the screenshot at the top of this README:
+
+```mermaid
+sequenceDiagram
+    participant R as stock_research
+    participant S as suitability
+    participant T as tax_awareness
+    participant G as guardrail_gate
+    participant F as finance_report
+
+    R->>S: candidates [XOM, CVX, ...]
+    R->>T: candidates [XOM, CVX, ...]
+    Note over S,T: same superstep — neither sees the other
+
+    S-->>G: approved + sized<br/>XOM $60k, CVX $60k
+    T-->>G: wash_sale_flags [XOM, CVX]
+
+    Note over G: reconcile
+    G->>G: strip flagged recs
+    G->>G: append reason to violations<br/>(client-visible)
+    G->>G: excluded_tickers += [XOM, CVX]<br/>guardrail_feedback += reasons
+
+    alt nothing survived and attempts < 3
+        G-->>R: retry — re-screen excluding<br/>rejected tickers, reasons in prompt
+    else something survived, or retries exhausted
+        G->>F: surviving recs + what was withheld
+        Note over F: dollars are NOT redistributed —<br/>the run simply deploys less
+    end
+```
 
 ## Configuration
 
@@ -213,18 +360,16 @@ reach the final recommendations.
 
 ## Layout
 
+See [the module responsibility table](#module-responsibilities) above for what each module owns.
+Everything else:
+
 ```
-orchestrator.py       LangGraph graph, guardrail gate, approval gate
-state.py              The AgentState passed between nodes
-checkpointer.py       Durable checkpoint selection (Postgres → SQLite → memory)
-config.py             Settings + environment safety validation
-db.py                 SQLAlchemy models, init, dev seed
-server.py             FastAPI app
-app.py                Solara dashboard
-agents/               The six agents, plus shared risk limits
-services/             Market data, news, and the shared LLM client
 demo_data.py          Demo client seeding
-demo.ipynb            The live demo
+demo.ipynb            The live demo, committed with outputs
+logging_setup.py      Logging configuration
+tests/                78 tests; no network or API key required
+docs/screenshots/     Images used by this README
+PLAN.md               The original build plan
 ```
 
 ## Scope and limitations
