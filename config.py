@@ -96,9 +96,12 @@ class Settings(BaseSettings):
     # Bounded so a long-lived worker screening a large universe cannot grow
     # the cache without limit.
     TICKER_INFO_CACHE_MAX_ENTRIES: int = 4096
-    # A quote older than this is not silently used for position sizing; the
-    # run records it as stale and the API surfaces it.
-    QUOTE_STALENESS_WARN_MINUTES: int = 90
+    # Staleness is measured in *trading* days, not clock time. These providers
+    # serve daily closes, so a Sunday-morning run legitimately sees a Friday
+    # print; a wall-clock threshold would flag every weekend and holiday run
+    # as degraded and train everyone to ignore the signal. A quote older than
+    # this many sessions is recorded as stale and surfaced by the API.
+    QUOTE_MAX_AGE_TRADING_DAYS: int = 2
 
     # LangGraph checkpointer. Human-in-the-loop approvals pause a run and
     # resume it on a later HTTP request, so the checkpoint must outlive the

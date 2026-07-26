@@ -148,10 +148,16 @@ def configure_logging(level: Optional[str] = None, force: bool = False) -> None:
     root.handlers = [handler]
     root.setLevel(resolved)
 
-    # yfinance and the HTTP stack are extremely chatty at INFO and drown out
-    # the agent narration that actually matters here.
-    for noisy in ("yfinance", "peewee", "urllib3", "httpx", "httpcore", "alembic"):
+    # The HTTP stack is extremely chatty at INFO and drowns out the agent
+    # narration that actually matters here.
+    for noisy in ("peewee", "urllib3", "httpx", "httpcore", "alembic", "primp"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # yfinance logs a multi-line ERROR block for every symbol it cannot
+    # resolve. Screening a wide universe legitimately touches names it has no
+    # data for, and the provider layer already reports those outcomes with the
+    # context of which run and which provider. Left at ERROR, a normal screen
+    # buries the real failures under hundreds of expected ones.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     _CONFIGURED = True
 
 

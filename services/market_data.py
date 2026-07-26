@@ -1,82 +1,102 @@
-"""Market data access: historical prices, current prices, and ticker metadata.
+"""Market data facade: quotes, history and security reference data.
 
-Everything that touches yfinance goes through this module so caching,
-failure handling, and logging are consistent.
+Everything in the system that needs a price goes through here. Agents never
+touch a provider directly, which is what makes the whole suite runnable with
+no network and no API keys — and what made a yfinance field rename a
+one-adapter change rather than three silently-broken agents.
 
-Three production bugs previously lived here and are fixed below:
+Three rules this module enforces on behalf of every caller:
 
-1.  `get_current_prices` cached a price of 0.0 whenever a fetch failed. That
-    0.0 was then served from cache for the next 24 hours, so a single
-    transient yfinance hiccup silently valued a client's entire holding at
-    $0 -- which cascades into wrong concentration percentages, wrong flaws,
-    and wrong position sizing, with no error anywhere. Failed lookups are now
-    never cached and are reported to the caller.
-2.  `fetch_historical_prices` wrote the cache with one SELECT + one INSERT
-    per (ticker, day). The macro basket alone is 12 tickers x ~126 trading
-    days, i.e. ~1,500 sequential round trips per run. It now reads existing
-    keys in one query and bulk-inserts the remainder.
-3.  yfinance `Ticker.info` was fetched independently by three agents, and
-    re-fetched from scratch on every research retry -- up to ~120 HTTP
-    round trips per run for the same ~30 symbols. `get_ticker_info` adds a
-    process-level TTL cache shared by all callers.
+1. **A failed lookup is never cached and never returned as zero.** The
+   original bug was cheap to write and expensive to have: a transient fetch
+   failure cached 0.0, that 0.0 was served for the next 24 hours, and a
+   client's entire holding was valued at nothing. Concentration percentages,
+   flaws and position sizes all silently followed. Unresolvable symbols are
+   omitted from the result and reported.
+
+2. **Staleness is data, not a footnote.** Every quote carries its age and its
+   source. A run that sized positions off a two-day-old close records that,
+   the report says so, and `/health` can see it.
+
+3. **Batch, don't loop.** A screen touches hundreds of symbols. Writing the
+   price cache row-by-row cost ~1,500 sequential round trips per run; reading
+   `.info` per agent cost ~120 HTTP calls for the same 30 symbols. Both are
+   now one query and one shared cache respectively.
 """
 
-from datetime import datetime, timedelta, timezone
+from collections import OrderedDict
+from datetime import datetime, timedelta
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
-import yfinance as yf
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from config import settings
-from db import MarketDataCache, SessionLocal
+from db import MarketDataCache, SessionLocal, engine, utcnow
 from logging_setup import get_logger
+from metrics import market_data_requests, stale_quotes
+from services.providers import AllProvidersFailed, Quote, SecurityInfo, call_with_failover
 
 logger = get_logger(__name__)
 
 
-def _utcnow() -> datetime:
-    """Naive UTC 'now'.
-
-    The DB columns are naive (SQLAlchemy DateTime without timezone) and the
-    seed data is naive UTC, so comparisons must stay naive. `datetime.utcnow()`
-    is deprecated in 3.12+, hence going through an aware object and dropping
-    the tzinfo explicitly rather than reintroducing the deprecated call.
-    """
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _cache_is_fresh(fetched_at: datetime) -> bool:
+def _cache_is_fresh(fetched_at: Optional[datetime]) -> bool:
     if fetched_at is None:
         return False
-    return _utcnow() - fetched_at < timedelta(hours=settings.MARKET_DATA_CACHE_TTL_HOURS)
+    return utcnow() - fetched_at < timedelta(hours=settings.MARKET_DATA_CACHE_TTL_HOURS)
 
 
-def _get_cached_current_price(db: Session, ticker: str) -> Optional[float]:
-    row = (
-        db.query(MarketDataCache)
-        .filter(MarketDataCache.ticker == ticker)
-        .order_by(MarketDataCache.as_of_date.desc())
-        .first()
-    )
-    # A cached 0.0 is meaningless as a price and only ever arises from a bad
-    # write; treat it as a miss so a stale bad row self-heals.
-    if row and row.close_price and row.close_price > 0 and _cache_is_fresh(row.fetched_at):
-        return row.close_price
-    return None
+# --- Price cache -------------------------------------------------------------
 
 
-def _bulk_upsert_cache(db: Session, rows: List[Tuple[str, datetime, float]]) -> None:
-    """Insert/update many (ticker, as_of_date, price) rows with two queries
-    instead of two per row."""
+def _bulk_upsert_cache(db: Session, rows: Sequence[Tuple[str, datetime, float, str]]) -> None:
+    """Write many (ticker, date, price, provider) rows in one statement.
+
+    On Postgres this is a real ON CONFLICT upsert. On SQLite it is a read of
+    the affected key range followed by one bulk insert — which is safe now
+    that (ticker, as_of_date) is unique, and was not before: the previous
+    read-then-write with no constraint let two concurrent runs duplicate bars,
+    silently double-weighting a day in every return series computed from them.
+    """
     if not rows:
         return
 
-    now = _utcnow()
-    tickers = {t for t, _, _ in rows}
-    dates = [d for _, d, _ in rows]
+    now = utcnow()
+    # Collapse duplicates within the batch first; a single statement cannot
+    # update the same key twice.
+    deduped: Dict[Tuple[str, datetime], Tuple[float, str]] = {}
+    for ticker, as_of, price, provider in rows:
+        deduped[(ticker, as_of)] = (price, provider)
 
+    payload = [
+        {
+            "ticker": ticker,
+            "as_of_date": as_of,
+            "close_price": price,
+            "provider": provider,
+            "fetched_at": now,
+        }
+        for (ticker, as_of), (price, provider) in deduped.items()
+    ]
+
+    if engine.dialect.name == "postgresql":
+        statement = pg_insert(MarketDataCache).values(payload)
+        db.execute(
+            statement.on_conflict_do_update(
+                index_elements=["ticker", "as_of_date"],
+                set_={
+                    "close_price": statement.excluded.close_price,
+                    "provider": statement.excluded.provider,
+                    "fetched_at": statement.excluded.fetched_at,
+                },
+            )
+        )
+        return
+
+    tickers = {t for t, _ in deduped}
+    dates = [d for _, d in deduped]
     existing = (
         db.query(MarketDataCache)
         .filter(
@@ -88,59 +108,179 @@ def _bulk_upsert_cache(db: Session, rows: List[Tuple[str, datetime, float]]) -> 
     )
     by_key = {(row.ticker, row.as_of_date): row for row in existing}
 
-    new_rows = []
-    for ticker, as_of_date, price in rows:
-        found = by_key.get((ticker, as_of_date))
+    fresh = []
+    for (ticker, as_of), (price, provider) in deduped.items():
+        found = by_key.get((ticker, as_of))
         if found is not None:
             found.close_price = price
+            found.provider = provider
             found.fetched_at = now
         else:
-            new_rows.append(
+            fresh.append(
                 MarketDataCache(
-                    ticker=ticker, as_of_date=as_of_date, close_price=price, fetched_at=now
+                    ticker=ticker,
+                    as_of_date=as_of,
+                    close_price=price,
+                    provider=provider,
+                    fetched_at=now,
                 )
             )
-    if new_rows:
-        db.bulk_save_objects(new_rows)
+    if fresh:
+        db.bulk_save_objects(fresh)
 
 
-def fetch_historical_prices(tickers: List[str], years: float = 1) -> pd.DataFrame:
+def _cached_quotes(db: Session, tickers: Sequence[str]) -> Dict[str, Quote]:
+    """Most recent cached bar per ticker, in one query rather than one each."""
+    if not tickers:
+        return {}
+    rows = (
+        db.query(MarketDataCache)
+        .filter(MarketDataCache.ticker.in_(list(tickers)))
+        .order_by(MarketDataCache.ticker, MarketDataCache.as_of_date.desc())
+        .all()
+    )
+    best: Dict[str, Quote] = {}
+    for row in rows:
+        if row.ticker in best:
+            continue  # ordered descending, so the first is the newest
+        price = float(row.close_price or 0)
+        # A cached 0.0 is meaningless as a price and only ever arises from a
+        # bad write; treat it as a miss so a stale bad row self-heals.
+        if price <= 0 or not _cache_is_fresh(row.fetched_at):
+            continue
+        best[row.ticker] = Quote(
+            symbol=row.ticker,
+            price=price,
+            as_of=row.as_of_date,
+            provider=row.provider or "cache",
+            stale=True,
+        )
+    return best
+
+
+# --- Public API --------------------------------------------------------------
+
+
+def get_quotes(tickers: Sequence[str], *, allow_cache: bool = True) -> Dict[str, Quote]:
+    """Latest price per ticker, with provenance and staleness.
+
+    Unresolvable tickers are omitted. Callers must treat a missing key as
+    "unknown value" and decide explicitly what to do — `load_client_state`
+    drops the holding from the run and says so, rather than valuing it at $0.
     """
-    Fetches historical adjusted close prices for the given tickers.
-    Every fetched close is written through to market_data_cache.
-    Returns an empty DataFrame (never raises) if the download fails.
+    tickers = [t.upper().strip() for t in tickers if t and t.upper() != "CASH"]
+    if not tickers:
+        return {}
+
+    db = SessionLocal()
+    try:
+        resolved: Dict[str, Quote] = {}
+        if allow_cache:
+            resolved = _cached_quotes(db, tickers)
+            for _ in resolved:
+                market_data_requests.labels("cache", "quotes", "cache_hit").inc()
+
+        missing = [t for t in tickers if t not in resolved]
+        if missing:
+            try:
+                live = call_with_failover(
+                    "quotes",
+                    lambda provider: provider.get_quotes(missing),
+                    accept=lambda result: bool(result),
+                )
+            except AllProvidersFailed as exc:
+                logger.warning(
+                    "No provider could quote %s (%s). These symbols are omitted from the "
+                    "result, so downstream valuation treats them as unknown rather than $0.",
+                    missing, exc,
+                )
+                live = {}
+
+            resolved.update(live)
+
+            today = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            to_cache = [
+                (quote.symbol, today, quote.price, quote.provider)
+                for quote in live.values()
+            ]
+            try:
+                _bulk_upsert_cache(db, to_cache)
+                db.commit()
+            except Exception as exc:  # noqa: BLE001 -- caching is best-effort
+                db.rollback()
+                logger.warning("Failed to cache %d quotes: %s", len(to_cache), exc)
+
+        unresolved = [t for t in tickers if t not in resolved]
+        if unresolved:
+            logger.warning(
+                "No usable price for %s -- omitted from the result and NOT cached.", unresolved
+            )
+
+        for quote in resolved.values():
+            if quote.is_stale():
+                stale_quotes.inc()
+
+        return resolved
+    finally:
+        db.close()
+
+
+def get_current_prices(tickers: Sequence[str]) -> Dict[str, float]:
+    """Plain symbol -> price mapping for callers that need nothing else."""
+    return {symbol: quote.price for symbol, quote in get_quotes(tickers).items()}
+
+
+def quote_provenance(quotes: Dict[str, Quote]) -> Dict[str, object]:
+    """Summarize where a run's prices came from, for the audit record.
+
+    Persisted onto `agent_runs.data_provenance`, which is what makes
+    "recompute this recommendation from the data it actually saw" a possible
+    request rather than an aspiration.
     """
+    if not quotes:
+        return {"symbols": 0, "providers": [], "oldest_trading_days": None, "stale_symbols": []}
+    ages = {symbol: quote.age_trading_days() for symbol, quote in quotes.items()}
+    return {
+        "symbols": len(quotes),
+        "providers": sorted({quote.provider for quote in quotes.values()}),
+        "oldest_trading_days": max(ages.values()),
+        "stale_symbols": sorted(s for s, quote in quotes.items() if quote.is_stale()),
+        # The oldest print in the set, not the newest: a report claiming data
+        # "as of" its freshest input overstates how current the analysis is.
+        "as_of": min(quote.as_of for quote in quotes.values()).isoformat(),
+    }
+
+
+def fetch_historical_prices(tickers: Sequence[str], years: float = 1) -> pd.DataFrame:
+    """Adjusted daily closes, one column per ticker.
+
+    Returns an empty DataFrame rather than raising: a missing history degrades
+    the analytics that need it (volatility, correlation, drawdown) while
+    leaving the rest of the run usable, and every consumer already handles the
+    empty case. The failure is logged and recorded as degradation.
+    """
+    tickers = [t.upper().strip() for t in tickers if t and t.upper() != "CASH"]
     if not tickers:
         return pd.DataFrame()
 
-    start_date = (datetime.now() - timedelta(days=int(years * 365))).strftime("%Y-%m-%d")
-
-    # yfinance handles multiple tickers space-separated.
-    # auto_adjust=False is required to get an "Adj Close" column at all --
-    # newer yfinance defaults to auto_adjust=True, which returns a
-    # pre-adjusted "Close" column and drops "Adj Close" entirely.
     try:
-        raw = yf.download(tickers, start=start_date, progress=False, auto_adjust=False)
-        data = raw["Adj Close"]
-    except Exception as exc:  # noqa: BLE001 -- data source failures are expected
-        logger.warning("Historical price download failed for %s: %s", tickers, exc)
+        data = call_with_failover(
+            "history",
+            lambda provider: provider.get_history(list(tickers), years),
+            accept=lambda frame: frame is not None and not frame.empty,
+        )
+    except AllProvidersFailed as exc:
+        logger.warning("No provider returned history for %s: %s", tickers, exc)
         return pd.DataFrame()
 
-    # If only one ticker, it returns a Series; we want a DataFrame
-    if isinstance(data, pd.Series):
-        data = data.to_frame()
-        data.columns = tickers
-
-    if data.empty:
-        logger.warning("Historical price download returned no rows for %s", tickers)
-        return data
-
-    rows: List[Tuple[str, datetime, float]] = []
+    rows: List[Tuple[str, datetime, float, str]] = []
     for ticker in data.columns:
-        for as_of_date, price in data[ticker].dropna().items():
+        for as_of, price in data[ticker].dropna().items():
             if pd.isna(price) or float(price) <= 0:
                 continue
-            rows.append((str(ticker), pd.Timestamp(as_of_date).to_pydatetime(), float(price)))
+            rows.append(
+                (str(ticker), pd.Timestamp(as_of).to_pydatetime(), float(price), "history")
+            )
 
     db = SessionLocal()
     try:
@@ -155,124 +295,108 @@ def fetch_historical_prices(tickers: List[str], years: float = 1) -> pd.DataFram
     return data
 
 
-def get_current_prices(tickers: List[str]) -> Dict[str, float]:
+# --- Security reference data -------------------------------------------------
+
+
+class _BoundedTTLCache:
+    """LRU + TTL cache for security metadata.
+
+    Bounded because a worker screening a large universe over days would
+    otherwise grow an unbounded dict — the previous cache had no eviction at
+    all. Negative results are cached for a shorter window so a delisted symbol
+    is not retried on every pass of every screen, but also does not stay
+    poisoned for an hour after a transient failure.
     """
-    Get the latest price for a list of tickers, serving from
-    market_data_cache when a fresh-enough (within
-    settings.MARKET_DATA_CACHE_TTL_HOURS) entry already exists.
 
-    Tickers whose price could not be determined are OMITTED from the result
-    rather than returned as 0.0, so callers can distinguish "this is worth
-    nothing" from "we don't know what this is worth". Failures are never
-    written to the cache.
+    def __init__(self, max_entries: int):
+        self._data: "OrderedDict[str, Tuple[datetime, Optional[SecurityInfo]]]" = OrderedDict()
+        self._max = max_entries
+        self._lock = Lock()
+
+    def get(self, key: str, ttl: timedelta, negative_ttl: timedelta):
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return False, None
+            cached_at, value = entry
+            limit = ttl if value is not None else negative_ttl
+            if utcnow() - cached_at >= limit:
+                del self._data[key]
+                return False, None
+            self._data.move_to_end(key)
+            return True, value
+
+    def put(self, key: str, value: Optional[SecurityInfo]) -> None:
+        with self._lock:
+            self._data[key] = (utcnow(), value)
+            self._data.move_to_end(key)
+            while len(self._data) > self._max:
+                self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+_info_cache = _BoundedTTLCache(settings.TICKER_INFO_CACHE_MAX_ENTRIES)
+
+
+def get_security_info(ticker: str) -> Optional[SecurityInfo]:
+    """Normalized reference data and fundamentals, cached in-process.
+
+    Returns None when no provider could describe the symbol, so callers can
+    treat "couldn't verify" as its own case. Suitability fails closed on it,
+    which is the right direction: an unverifiable security is not one to
+    recommend.
     """
-    if not tickers:
-        return {}
-
-    db = SessionLocal()
-    try:
-        prices: Dict[str, float] = {}
-        missing: List[str] = []
-        for ticker in tickers:
-            cached = _get_cached_current_price(db, ticker)
-            if cached is not None:
-                prices[ticker] = cached
-            else:
-                missing.append(ticker)
-
-        if not missing:
-            return prices
-
-        try:
-            raw = yf.download(missing, period="5d", progress=False, auto_adjust=False)
-            data = raw["Adj Close"]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Current price download failed for %s: %s", missing, exc)
-            return prices
-
-        if isinstance(data, pd.Series):
-            data = data.to_frame()
-            data.columns = missing
-
-        today = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-        to_cache: List[Tuple[str, datetime, float]] = []
-        unresolved: List[str] = []
-        for ticker in missing:
-            price = None
-            if ticker in data.columns:
-                series = data[ticker].dropna()
-                if not series.empty:
-                    candidate = float(series.iloc[-1])
-                    if candidate > 0:
-                        price = candidate
-            if price is None:
-                unresolved.append(ticker)
-                continue
-            prices[ticker] = price
-            to_cache.append((ticker, today, price))
-
-        if unresolved:
-            logger.warning(
-                "No usable current price for %s -- omitted from the result and NOT cached, "
-                "so downstream valuation treats them as unknown rather than $0.",
-                unresolved,
-            )
-
-        try:
-            _bulk_upsert_cache(db, to_cache)
-            db.commit()
-        except Exception as exc:  # noqa: BLE001 -- caching is best-effort
-            db.rollback()
-            logger.warning("Failed to cache current prices: %s", exc)
-
-        return prices
-    finally:
-        db.close()
-
-
-# ---------------------------------------------------------------------------
-# Ticker metadata (`Ticker.info`) with a process-level TTL cache.
-# ---------------------------------------------------------------------------
-
-_info_cache: Dict[str, Tuple[datetime, Optional[Dict[str, Any]]]] = {}
-_info_lock = Lock()
-
-
-def get_ticker_info(ticker: str) -> Optional[Dict[str, Any]]:
-    """Best-effort fetch of yfinance's `.info` dict, cached in-process.
-
-    Returns None on any failure (network error, delisted ticker, empty or
-    unexpected response) so callers can treat "couldn't verify" as its own
-    explicit case instead of crashing. Negative results are cached too, for a
-    shorter window, so a delisted symbol doesn't get retried on every
-    candidate loop.
-    """
+    ticker = ticker.upper().strip()
     ttl = timedelta(minutes=settings.TICKER_INFO_CACHE_TTL_MINUTES)
     negative_ttl = min(ttl, timedelta(minutes=5))
-    now = _utcnow()
 
-    with _info_lock:
-        entry = _info_cache.get(ticker)
-        if entry is not None:
-            cached_at, value = entry
-            age_limit = ttl if value is not None else negative_ttl
-            if now - cached_at < age_limit:
-                return value
+    hit, cached = _info_cache.get(ticker, ttl, negative_ttl)
+    if hit:
+        market_data_requests.labels("cache", "info", "cache_hit").inc()
+        return cached
 
     try:
-        info = yf.Ticker(ticker).info
-        if not info or not isinstance(info, dict):
-            info = None
-    except Exception as exc:  # noqa: BLE001 -- data source failures are expected
-        logger.debug("yfinance .info fetch failed for %s: %s", ticker, exc)
+        info = call_with_failover(
+            "info",
+            lambda provider: provider.get_security_info(ticker),
+            # A provider that supplies identity but no market cap has not
+            # given us enough to make a suitability call, so keep looking.
+            accept=lambda result: result is not None and result.is_usable(),
+        )
+    except AllProvidersFailed as exc:
+        logger.debug("No provider could describe %s: %s", ticker, exc)
         info = None
 
-    with _info_lock:
-        _info_cache[ticker] = (now, info)
+    _info_cache.put(ticker, info)
     return info
+
+
+def get_ticker_info(ticker: str) -> Optional[dict]:
+    """Backwards-compatible dict view of `get_security_info`.
+
+    Kept so the demo notebook and any external caller written against the old
+    signature keep working. New code should use `get_security_info`, whose
+    field names do not change when a vendor renames theirs.
+    """
+    info = get_security_info(ticker)
+    if info is None:
+        return None
+    return {
+        "sector": info.sector,
+        "industry": info.industry,
+        "exchange": info.exchange,
+        "marketCap": info.market_cap,
+        "beta": info.beta,
+        "trailingPE": info.pe_ratio,
+        "priceToBook": info.pb_ratio,
+        "dividendYield": info.dividend_yield,
+        "longName": info.name,
+    }
 
 
 def clear_ticker_info_cache() -> None:
     """Used by tests and by the demo notebook to guarantee a cold start."""
-    with _info_lock:
-        _info_cache.clear()
+    _info_cache.clear()
