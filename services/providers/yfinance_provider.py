@@ -118,6 +118,38 @@ class YFinanceProvider(MarketDataProvider):
         return frame.dropna(how="all")
 
     @staticmethod
+    def _dividend_yield(raw: Dict[str, Any], last_price: Optional[float]) -> Optional[float]:
+        """Dividend yield as a fraction, derived rather than guessed.
+
+        `dividendYield` is a percentage in current yfinance (0.63 means
+        0.63%), but it has been a fraction in past releases, and the obvious
+        "divide by 100 if it looks big" heuristic silently breaks for every
+        name yielding under 1% -- Costco came through as a 63% yield, which
+        then topped the yield factor of an income screen.
+
+        So: prefer the annual rate over the price, which cannot be
+        misinterpreted. Fall back to `trailingAnnualDividendYield`, which is
+        unambiguously a fraction. Only then fall back to the percentage field,
+        which is the sole source for most ETFs.
+        """
+        rate = _num(raw, "dividendRate")
+        if rate is not None and last_price and last_price > 0:
+            derived = rate / last_price
+            if 0 < derived < 0.25:
+                return round(derived, 6)
+
+        trailing = _num(raw, "trailingAnnualDividendYield")
+        if trailing is not None and 0 < trailing < 0.25:
+            return round(trailing, 6)
+
+        percent = _num(raw, "dividendYield")
+        if percent is not None and 0 < percent < 25:
+            return round(percent / 100.0, 6)
+
+        # A yield of zero is a fact about a non-payer, not missing data.
+        return 0.0 if percent == 0 or trailing == 0 else None
+
+    @staticmethod
     def _adj_close(raw: pd.DataFrame, symbols: List[str]) -> Optional[pd.DataFrame]:
         """Pull the adjusted-close frame out of yfinance's shape-shifting result.
 
@@ -163,9 +195,19 @@ class YFinanceProvider(MarketDataProvider):
             return None
 
         warnings: List[str] = []
+        quote_type = (info.get("quoteType") or "").upper()
+        is_fund = quote_type in ("ETF", "MUTUALFUND")
+
+        # A fund has no market capitalisation; its size is assets under
+        # management. Reading only `marketCap` left every ETF with no size at
+        # all, which failed the usability check and silently dropped the
+        # entire core allocation -- the instruments most likely to be the
+        # right answer -- from the investable universe.
         market_cap = _num(info, "marketCap")
+        if market_cap is None and is_fund:
+            market_cap = _num(info, "totalAssets", "netAssets")
         if market_cap is None:
-            warnings.append("no market capitalisation reported")
+            warnings.append("no market capitalisation or fund assets reported")
 
         # Dollar volume, not share volume: 10M shares of a $2 stock and 10M of
         # a $400 stock are entirely different liquidity situations, and only
@@ -176,13 +218,7 @@ class YFinanceProvider(MarketDataProvider):
             avg_volume * last_price if avg_volume is not None and last_price is not None else None
         )
 
-        yield_raw = _num(info, "dividendYield")
-        # yfinance has reported this both as a fraction and as a percentage
-        # across releases. Anything above 1.0 is a percentage -- a 100%+
-        # dividend yield is not a thing this screen will legitimately see.
-        dividend_yield = (
-            yield_raw / 100.0 if yield_raw is not None and yield_raw > 1.0 else yield_raw
-        )
+        dividend_yield = self._dividend_yield(info, last_price)
 
         debt_to_equity = _num(info, "debtToEquity")
         if debt_to_equity is not None and debt_to_equity > 5:
@@ -198,7 +234,7 @@ class YFinanceProvider(MarketDataProvider):
             exchange=info.get("exchange"),
             currency=info.get("currency", "USD"),
             country=info.get("country"),
-            quote_type=info.get("quoteType"),
+            quote_type=quote_type or None,
             market_cap=market_cap,
             avg_dollar_volume=avg_dollar_volume,
             beta=_num(info, "beta", "beta3Year"),

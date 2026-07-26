@@ -26,6 +26,21 @@ sqlalchemy==2.0.51
 psycopg2-binary==2.9.12
 pydantic==2.13.4
 pydantic-settings==2.14.2
+# Schema migrations. create_all can add a table but never alter one, so
+# without this any column change is a manual DDL script applied by hand to
+# each environment -- and eventually to only some of them.
+alembic==1.18.5
+email-validator==2.3.0
+
+# Auth
+# bcrypt is used directly rather than through passlib: passlib 1.7.4 reads
+# bcrypt.__about__, which bcrypt 4.1 removed, so the combination emits errors
+# on every hash.
+bcrypt==5.0.0
+pyjwt==2.12.1
+
+# Observability
+prometheus-client==0.24.1
 
 # Analytics
 numpy==2.5.1

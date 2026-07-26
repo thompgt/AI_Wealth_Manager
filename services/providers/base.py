@@ -118,11 +118,21 @@ class SecurityInfo:
     def is_usable(self) -> bool:
         """Enough identity to make a suitability decision about.
 
-        A record with no exchange and no market cap is not a security we
-        verified; it is a symbol we failed to look up. Suitability fails
-        closed on this, which is the correct direction.
+        A record with no exchange and no size is not a security we verified;
+        it is a symbol we failed to look up. Suitability fails closed on this,
+        which is the correct direction.
+
+        Funds are held to a weaker bar: some providers report neither AUM nor
+        expense ratio for an ETF, and an exchange plus a name is still a
+        positively identified, exchange-listed instrument. Requiring a market
+        cap of them excluded every index fund in the universe -- the
+        instruments a diversification problem is most often solved with.
         """
-        return bool(self.exchange) and self.market_cap is not None
+        if not self.exchange:
+            return False
+        if (self.quote_type or "").upper() in ("ETF", "MUTUALFUND"):
+            return bool(self.name)
+        return self.market_cap is not None
 
 
 @dataclass
