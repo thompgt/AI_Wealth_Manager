@@ -1,268 +1,204 @@
-"""Tax-Awareness Agent.
+"""Tax-Awareness: what a proposed trade costs after tax.
 
-A deterministic LangGraph node -- NO LLM calls anywhere in this module. It
-checks a real, precise tax rule (the 30-day wash-sale rule) with plain
-date-math and DB queries, and layers on lightweight tax-efficiency
-observations (embedded gain/loss awareness) that downstream
-report-generation can surface to the client.
+Deterministic. The real work lives in `services/tax_lots.py`; this node applies
+it to the run's candidates and produces the assessment the guardrail gate
+enforces.
 
-Ported from the legacy agents/tax_architect.py's wash-sale check
-(SELLs in the last 30 days -> flag any proposed BUY of the same symbol),
-generalized to:
-  - the new db.py schema (TransactionLog.client_id, the Holding model,
-    ClientProfile instead of UserProfile)
-  - produce a structured TaxAssessment (see state.py) that the orchestrator
-    routes on, instead of raising/forcing a rebuild directly
-  - embedded gain/loss awareness across the client's current Holding rows,
-    using live prices from services/market_data.get_current_prices
+Two changes from the previous version are worth stating plainly, because they
+change outcomes rather than implementation:
+
+* **The wash-sale check no longer fires on profitable sales.** It used to flag
+  any sale of a symbol in the last 30 days, so a client who took a *gain* was
+  blocked from re-buying that name for a month, and the retry loop spent its
+  budget working around a restriction that did not exist. It now requires an
+  actual realized loss, in an actual taxable account.
+
+* **It fails closed.** The old node caught every exception and returned empty
+  wash-sale flags, so a transient database error silently disabled the only
+  hard tax guardrail while the run reported success. A tax check that cannot
+  run must block rather than wave through, so a failure here produces an
+  explicit "could not verify" state the guardrail gate treats as blocking.
 """
 
-import os
-import sys
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Set
+from typing import Dict, List, Optional
 
-# Allow running this file directly (`python agents/tax_awareness.py`) as well
-# as importing it as part of the `agents` package -- both need the repo
-# root on sys.path so `import db`, `import state`, etc. resolve.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+from db import ClientProfile as ClientProfileModel
+from db import SessionLocal
+from logging_setup import get_logger
+from services import tax_lots
+from services.policy import resolve as resolve_policy
+from services.portfolio import load_portfolio
+from state import AgentState, TaxAssessment
 
-from db import Holding, SessionLocal, TransactionLog, utcnow
-from services.market_data import get_current_prices
-from state import AgentRunRecord, AgentState, Candidate, TaxAssessment
+from agents.runtime import finish, node_run
+
+logger = get_logger(__name__)
 
 NODE_NAME = "tax_awareness"
 
-# IRS wash-sale rule: cannot claim a loss on a security sold if a
-# "substantially identical" security is bought within 30 days before or
-# after the sale. We only have visibility into our own transaction log, so
-# this checks the 30-day-after side (a proposed BUY following a recent SELL).
-WASH_SALE_WINDOW_DAYS = 30
-
-# Unrealized gain, as a fraction of cost basis, above which we flag the
-# position as carrying a meaningful embedded tax liability worth planning
-# around before trimming it.
-SIGNIFICANT_GAIN_THRESHOLD = 0.20
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _get_recent_sold_symbols(db, client_id: int) -> Set[str]:
-    """Symbols sold by this client within the wash-sale window, using the
-    same naive-UTC convention as the rest of the codebase (db.py's
-    TransactionLog.timestamp and seed data are naive UTC)."""
-    cutoff = utcnow() - timedelta(days=WASH_SALE_WINDOW_DAYS)
-    recent_sells = (
-        db.query(TransactionLog)
-        .filter(
-            TransactionLog.client_id == client_id,
-            TransactionLog.transaction_type == "SELL",
-            TransactionLog.timestamp >= cutoff,
-        )
-        .all()
-    )
-    return {log.asset_symbol for log in recent_sells}
-
-
-def _wash_sale_check(candidates: List[Candidate], sold_symbols: Set[str]):
-    flags: List[str] = []
-    notes: List[str] = []
-    for candidate in candidates:
-        ticker = candidate["ticker"]
-        if ticker in sold_symbols and ticker not in flags:
-            flags.append(ticker)
-            notes.append(
-                f"{ticker} was sold within the last {WASH_SALE_WINDOW_DAYS} days -- "
-                f"buying it back now would be a wash-sale violation and disallow any "
-                f"realized loss on the original sale. Consider waiting out the "
-                f"{WASH_SALE_WINDOW_DAYS}-day window before repurchasing, or evaluate "
-                f"a correlated-but-not-identical substitute security instead (specific "
-                f"substitute selection is Stock Research's job, not this check's)."
-            )
-    return flags, notes
-
-
-def _embedded_gain_loss_notes(holdings: List[Holding], prices: Dict[str, float]) -> List[str]:
-    notes: List[str] = []
-    for holding in holdings:
-        if holding.symbol == "CASH":
-            continue  # no meaningful cost-basis gain/loss on the cash sleeve
-
-        price = prices.get(holding.symbol)
-        if price is None or price <= 0 or holding.cost_basis <= 0:
-            continue  # can't compute a meaningful gain/loss without real data
-
-        cost_total = holding.quantity * holding.cost_basis
-        market_value = holding.quantity * price
-        gain = market_value - cost_total
-        pct = gain / cost_total if cost_total else 0.0
-
-        if gain < 0:
-            notes.append(
-                f"{holding.symbol} is sitting at an unrealized loss of "
-                f"${abs(gain):,.2f} ({pct * 100:.1f}%) -- a potential tax-loss-"
-                f"harvesting candidate."
-            )
-        elif pct > SIGNIFICANT_GAIN_THRESHOLD:
-            notes.append(
-                f"{holding.symbol} carries an unrealized gain of ${gain:,.2f} "
-                f"({pct * 100:.1f}%) -- if Portfolio Diagnostics flags this position "
-                f"as over-concentrated, trimming it would trigger a taxable event "
-                f"worth planning around (e.g. tax-lot selection, spreading the sale "
-                f"across tax years)."
-            )
-    return notes
+# Losses smaller than this are not worth trading: the spread and the
+# administrative cost of harvesting exceed the value of the deduction.
+MIN_HARVEST_LOSS = 500.0
 
 
 def tax_awareness_node(state: AgentState) -> dict:
-    started_at = _now_iso()
-    client_id = state["client_profile"]["client_id"]
-    candidates: List[Candidate] = state.get("candidate_stocks") or []
+    """Assess the tax consequences of this run's candidates."""
+    assessment: Optional[TaxAssessment] = None
 
-    error_detail = None
-    try:
+    with node_run(NODE_NAME, state) as ctx:
+        candidates = list(state.get("candidate_stocks") or [])
+        profile = state.get("client_profile") or {}
+        client_id = profile.get("client_id")
+
         db = SessionLocal()
         try:
-            sold_symbols = _get_recent_sold_symbols(db, client_id)
-            wash_sale_flags, wash_notes = _wash_sale_check(candidates, sold_symbols)
+            client = (
+                db.query(ClientProfileModel).filter(ClientProfileModel.id == client_id).first()
+            )
+            if client is None:
+                raise ValueError(f"No client profile with id {client_id}")
 
-            holdings = db.query(Holding).filter(Holding.client_id == client_id).all()
-            non_cash_symbols = [h.symbol for h in holdings if h.symbol != "CASH"]
-            prices = get_current_prices(non_cash_symbols) if non_cash_symbols else {}
-            gain_loss_notes = _embedded_gain_loss_notes(holdings, prices)
+            policy = resolve_policy(db, client)
+            ctx.policy_version = policy.version
+
+            accounts = list(client.accounts)
+            taxable = [a for a in accounts if a.tax_treatment == "taxable"]
+            ctx.input_snapshot = {
+                "candidates": [c.get("ticker") for c in candidates],
+                "accounts": len(accounts),
+                "taxable_accounts": len(taxable),
+                "lot_method": policy.lot_selection_method,
+            }
+
+            notes: List[str] = []
+            wash_sale_flags: List[str] = []
+            wash_sale_detail: List[Dict[str, object]] = []
+
+            if not taxable:
+                notes.append(
+                    "This client holds no taxable accounts, so the wash-sale rule and loss "
+                    "harvesting do not apply. Gains and losses inside tax-deferred and "
+                    "tax-exempt accounts have no current tax consequence."
+                )
+            else:
+                for candidate in candidates:
+                    ticker = str(candidate.get("ticker") or "").upper()
+                    if not ticker:
+                        continue
+                    target_account = None
+                    account_id = candidate.get("account_id")
+                    if account_id:
+                        target_account = next((a for a in accounts if a.id == account_id), None)
+
+                    finding = tax_lots.check_wash_sale(
+                        db, client.id, ticker, target_account=target_account
+                    )
+                    if finding is not None:
+                        wash_sale_flags.append(ticker)
+                        wash_sale_detail.append(finding.to_dict())
+                        logger.info("[Tax] wash-sale flag on %s: %s", ticker, finding.reason)
+
+            # Harvesting opportunities are independent of the candidates: they
+            # concern what the client already holds.
+            view = load_portfolio(db, client)
+            prices = {h.symbol: h.price for h in view.holdings}
+            harvest: List[Dict[str, object]] = []
+            if policy.harvest_losses and taxable:
+                harvest = tax_lots.harvestable_losses(
+                    db, client, prices, min_loss=MIN_HARVEST_LOSS
+                )
+                for entry in harvest[:5]:
+                    conflict = entry.get("wash_sale_conflict")
+                    tail = (
+                        f", but note: {conflict}"
+                        if conflict
+                        else ", and the exposure could be maintained with a similar but not "
+                             "substantially identical holding."
+                    )
+                    notes.append(
+                        f"{entry['symbol']} in {entry['account_name']} is "
+                        f"${abs(entry['unrealized_loss']):,.0f} below its cost basis. "
+                        f"Realizing that loss would offset gains elsewhere{tail}"
+                    )
+
+            realized = tax_lots.realized_gains(db, client)
+            if realized.get("total"):
+                disallowed = realized.get("wash_sale_disallowed") or 0
+                notes.append(
+                    f"Realized year to date: ${realized['short_term']:,.0f} short-term and "
+                    f"${realized['long_term']:,.0f} long-term."
+                    + (
+                        f" ${disallowed:,.0f} of losses is currently disallowed under the "
+                        f"wash-sale rule and deferred into the basis of replacement shares."
+                        if disallowed
+                        else ""
+                    )
+                )
+
+            # Short-term gain budget: a rebalance that would push realized
+            # short-term gains past the client's stated tolerance should say so
+            # before the trade, not after it.
+            if policy.max_short_term_gain_budget is not None:
+                remaining = policy.max_short_term_gain_budget - realized.get("short_term", 0.0)
+                if remaining <= 0:
+                    notes.append(
+                        f"This client's ${policy.max_short_term_gain_budget:,.0f} short-term "
+                        f"gain budget for the year is exhausted. Prefer long-held lots, or "
+                        f"defer discretionary sales into the next tax year."
+                    )
+                else:
+                    notes.append(
+                        f"${remaining:,.0f} of the client's short-term gain budget remains "
+                        f"for this tax year."
+                    )
+
+            if not notes:
+                notes.append(
+                    "No wash-sale conflicts, harvesting opportunities or realized gains to "
+                    "report for this client."
+                )
+
+            assessment = TaxAssessment(
+                wash_sale_flags=sorted(set(wash_sale_flags)),
+                wash_sale_detail=wash_sale_detail,
+                harvest_candidates=harvest,
+                realized_ytd=realized,
+                estimated_tax_cost=0.0,
+                tax_efficiency_notes=notes,
+                verification_failed=False,
+            )
+
+            ctx.output_snapshot = {
+                "wash_sale_flags": assessment["wash_sale_flags"],
+                "harvest_candidates": len(harvest),
+                "realized_total": realized.get("total", 0.0),
+            }
+            ctx.summary = (
+                f"{len(assessment['wash_sale_flags'])} wash-sale flag(s), "
+                f"{len(harvest)} harvesting opportunity(ies), "
+                f"${realized.get('total', 0.0):,.0f} realized year to date."
+            )
+            logger.info("[Tax] %s", ctx.summary)
         finally:
             db.close()
 
-        tax_efficiency_notes = wash_notes + gain_loss_notes
-
-        tax_assessment: TaxAssessment = {
-            "wash_sale_flags": wash_sale_flags,
-            "tax_efficiency_notes": tax_efficiency_notes,
-        }
-        status = "success"
-        summary = (
-            f"Checked {len(candidates)} candidate(s) against {len(sold_symbols)} "
-            f"recent sell(s) in the {WASH_SALE_WINDOW_DAYS}-day window; "
-            f"{len(wash_sale_flags)} wash-sale flag(s); {len(gain_loss_notes)} "
-            f"embedded gain/loss note(s)."
+    if assessment is None:
+        # Fail closed. The previous version returned empty flags on any
+        # exception, so a database blip silently disabled the wash-sale
+        # guardrail while the run still reported success. An unverifiable tax
+        # position is not a clean one.
+        assessment = TaxAssessment(
+            wash_sale_flags=[],
+            wash_sale_detail=[],
+            harvest_candidates=[],
+            realized_ytd={},
+            estimated_tax_cost=0.0,
+            tax_efficiency_notes=[
+                "The tax assessment could not be completed, so no purchase in this run has "
+                "been checked against the wash-sale rule. Every proposed purchase is "
+                "unverified for tax purposes until this is resolved."
+            ],
+            verification_failed=True,
         )
-    except Exception as exc:  # noqa: BLE001 -- node must never crash the graph
-        status = "error"
-        error_detail = repr(exc)
-        summary = "Tax-awareness assessment failed; returning safe defaults."
-        tax_assessment = {
-            "wash_sale_flags": [],
-            "tax_efficiency_notes": [f"Tax assessment could not be computed: {exc}"],
-        }
 
-    record: AgentRunRecord = {
-        "node_name": NODE_NAME,
-        "started_at": started_at,
-        "completed_at": _now_iso(),
-        "status": status,
-        "summary": summary,
-        "error_detail": error_detail,
-    }
-
-    return {"tax_assessment": tax_assessment, "audit_trail": [record]}
-
-
-if __name__ == "__main__":
-    import json
-    import uuid
-
-    from db import ClientProfile as ClientProfileRow
-    from db import Holding as HoldingRow
-    from services.market_data import get_current_prices as _get_current_prices
-    from state import ClientProfile
-
-    db = SessionLocal()
-    try:
-        client_row = db.query(ClientProfileRow).filter(ClientProfileRow.id == 1).first()
-        if client_row is None:
-            raise SystemExit("client_id=1 not found -- run `python db.py` to seed the DB first.")
-
-        holding_rows = db.query(HoldingRow).filter(HoldingRow.client_id == 1).all()
-
-        holdings: Dict[str, float] = {}
-        non_cash_symbols = [h.symbol for h in holding_rows if h.symbol != "CASH"]
-        current_prices = _get_current_prices(non_cash_symbols) if non_cash_symbols else {}
-
-        for h in holding_rows:
-            if h.symbol == "CASH":
-                holdings["CASH"] = h.quantity
-            else:
-                price = current_prices.get(h.symbol, 0.0)
-                holdings[h.symbol] = h.quantity * price
-
-        client_profile: ClientProfile = {
-            "client_id": client_row.id,
-            "age": client_row.age,
-            "risk_tolerance": client_row.risk_tolerance,
-            "time_horizon_years": client_row.time_horizon_years,
-            "goals": client_row.goals or [],
-            "holdings": holdings,
-            "net_worth": client_row.net_worth,
-        }
-    finally:
-        db.close()
-
-    # The seeded DB has a TSLA SELL dated 15 days ago for client_id=1 -- a
-    # proposed TSLA BUY should get wash-sale-flagged. AAPL has no recent
-    # sell on record and should NOT be flagged.
-    candidate_stocks: List[Candidate] = [
-        {
-            "ticker": "TSLA",
-            "valuation_metrics": {"pe_ratio": 60.0},
-            "addresses_flaw": "smoke-test candidate",
-            "regime_fit_rationale": "smoke-test candidate",
-            "confidence": 0.5,
-        },
-        {
-            "ticker": "AAPL",
-            "valuation_metrics": {"pe_ratio": 28.0},
-            "addresses_flaw": "smoke-test candidate",
-            "regime_fit_rationale": "smoke-test candidate",
-            "confidence": 0.5,
-        },
-    ]
-
-    sample_state: AgentState = {
-        "run_id": str(uuid.uuid4()),
-        "client_profile": client_profile,
-        "portfolio_diagnostics": None,
-        "market_regime": None,
-        "candidate_stocks": candidate_stocks,
-        "suitability_result": None,
-        "tax_assessment": None,
-        "final_report": None,
-        "audit_trail": [],
-        "requires_human_approval": False,
-        "human_approved": None,
-        "research_attempts": 0,
-        "needs_research_retry": False,
-    }
-
-    print("Client profile / holdings used for this smoke test:")
-    print(json.dumps(client_profile, indent=2))
-    print()
-    print("Candidate stocks: TSLA (expect wash-sale flag), AAPL (expect no flag)")
-    print()
-
-    result = tax_awareness_node(sample_state)
-
-    print("=== tax_assessment ===")
-    print(json.dumps(result["tax_assessment"], indent=2))
-    print()
-    print("=== audit_trail ===")
-    print(json.dumps(result["audit_trail"], indent=2))
-
-    flags = result["tax_assessment"]["wash_sale_flags"]
-    assert "TSLA" in flags, f"expected TSLA to be wash-sale flagged, got {flags}"
-    assert "AAPL" not in flags, f"expected AAPL to NOT be wash-sale flagged, got {flags}"
-    print()
-    print("PASS: TSLA flagged, AAPL not flagged.")
+    return finish(ctx, {"tax_assessment": assessment})

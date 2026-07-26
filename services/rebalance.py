@@ -553,8 +553,40 @@ def _projected_drift(
     return sorted(entries, key=lambda e: -abs(e.drift))
 
 
+def _merge_duplicates(plan: RebalancePlan) -> None:
+    """Combine proposals for the same symbol, account and side into one trade.
+
+    A portfolio breaching both its position limit and its sector limit
+    generates a trim for each, and although the amounts are correctly netted,
+    presenting them as two separate sales of the same stock is wrong in two
+    ways: the client reads it as two decisions, and the executor places two
+    orders where one would do, paying the spread twice.
+    """
+    merged: Dict[tuple, TradeProposalDraft] = {}
+    for proposal in plan.proposals:
+        key = (proposal.account_id, proposal.symbol, proposal.side)
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = proposal
+            continue
+        existing.notional += proposal.notional
+        if existing.quantity is not None and proposal.quantity is not None:
+            existing.quantity = round(existing.quantity + proposal.quantity, 6)
+        if existing.estimated_tax_cost is not None and proposal.estimated_tax_cost is not None:
+            existing.estimated_tax_cost += proposal.estimated_tax_cost
+        # Keep both reasons: the trade serves both constraints, and dropping
+        # one would understate why it is being made.
+        if proposal.addresses_flaw and proposal.addresses_flaw not in (existing.addresses_flaw or ""):
+            existing.addresses_flaw = f"{existing.addresses_flaw}; {proposal.addresses_flaw}"
+            existing.rationale = (
+                f"{existing.rationale} This trade also addresses: {proposal.addresses_flaw}."
+            )
+    plan.proposals = list(merged.values())
+
+
 def _sequence(plan: RebalancePlan) -> None:
-    """Number the proposals so sells always execute before buys."""
+    """Merge duplicates, then number so sells always execute before buys."""
+    _merge_duplicates(plan)
     for index, proposal in enumerate(sorted(plan.proposals, key=lambda p: (p.side != "SELL",))):
         proposal.sequence = index
 

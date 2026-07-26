@@ -1,470 +1,460 @@
-"""Finance Report Agent.
+"""Finance Report: the client-facing narrative.
 
-The client-facing "expert" narrator. This is the terminal node of the graph:
-it does NOT call any tools or fetch any of its own data. Instead it reads the
-FULL AgentState -- everything every upstream agent has already produced --
-and synthesizes it into one coherent, professional report.
+This node reads state and makes no tool calls, which is deliberate — the
+report must describe what the analysis found, never go looking for new facts
+to describe. Every number it can cite has already been computed, checked and
+recorded upstream.
 
-This is the natural evolution of the legacy
-backend/app/agents/agent_workflow.py's report-writing prompt (same
-"Portfolio Health Check / Market Context / Recommendations" spirit) but
-restructured to consume the richer multi-agent state up front rather than
-calling tools ad hoc mid-conversation.
+Two properties matter more than prose quality:
 
-Grounding requirement: the LLM prompt explicitly forbids inventing tickers,
-numbers, or news not present in the structured data it is given. If the LLM
-call fails for any reason (e.g. no real GEMINI_API_KEY is configured in this
-environment), a deterministic, template-based fallback report is assembled
-directly from the structured state so the graph always produces a usable,
-non-empty final_report.
+**It cannot silently substitute a template for analysis.** When the LLM is
+unavailable, the deterministic report is produced *and says so*, in a banner
+that distinguishes "no model is configured" from "the model call failed". A
+system that quietly serves template output as AI analysis is lying to the
+person relying on it, and the whole point of this project is the opposite.
+
+**It must disclose what was withheld and what degraded.** The interesting
+behaviour of this system is not that it recommends things; it is where it
+refuses to. A report that lists five buys and omits the two that were blocked
+on a wash sale, or that reads confidently while the regime call came from a
+fallback, is the failure mode all the upstream guardrails exist to prevent.
 """
 
-from datetime import datetime, timezone
-from typing import Any, Dict
-
-from langchain_core.prompts import ChatPromptTemplate
+import json
+from typing import Any, Dict, List, Optional
 
 from config import settings
+from db import utcnow
 from logging_setup import get_logger
-from services.llm import get_chat_model, invoke_with_retry
-from state import AgentRunRecord, AgentState
+from services.llm import LLMUnavailable, classify_failure, get_chat_model, invoke_tracked
+from state import AgentState
+
+from agents.runtime import finish, node_run, summarize_degradations
 
 logger = get_logger(__name__)
 
 NODE_NAME = "finance_report"
+PROMPT_VERSION = "report-v2"
+DISCLOSURE_VERSION = "2026-07"
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _pct(x: float) -> str:
+def _pct(value: Optional[float]) -> str:
+    if value is None:
+        return "not available"
     try:
-        return f"{x * 100:.1f}%"
+        return f"{value * 100:.1f}%"
     except (TypeError, ValueError):
-        return "N/A"
+        return "not available"
 
 
-# --------------------------------------------------------------------------
-# Prompt construction
-# --------------------------------------------------------------------------
+def _money(value: Optional[float]) -> str:
+    if value is None:
+        return "not available"
+    try:
+        return f"${value:,.0f}"
+    except (TypeError, ValueError):
+        return "not available"
 
-SYSTEM_PROMPT = """You are the Finance Report Agent for a wealth-management platform. \
-You write the final, client-facing report that synthesizes the output of several \
-upstream specialist agents (portfolio diagnostics, market regime analysis, \
-stock research + suitability/compliance review, and tax-awareness screening).
 
-CRITICAL GROUNDING RULES -- follow these strictly:
-- Only state facts, numbers, tickers, and findings that are explicitly present \
-in the structured data provided to you below. Never invent, estimate, or \
-hallucinate a ticker, price, metric, or news item that is not given to you.
-- If a section of data is empty, say so plainly instead of making something up.
-- Do not give individualized investment advice framed as a directive to act; \
-this is an informational/educational report only.
-- Quote the client profile, portfolio diagnostics, market regime, suitability \
-result, and tax assessment data as your only source of truth.
+SYSTEM_PROMPT = """You are the report writer for a wealth-management platform. You write the
+final client-facing report synthesizing the output of several specialist
+agents: portfolio diagnostics, market regime analysis, security research, a
+suitability guardrail, a tax-awareness check and a rebalancing planner.
 
-Write a professional, clear, client-friendly report with EXACTLY these six \
-sections, using these headings:
+GROUNDING RULES -- these are absolute:
+- State only facts, numbers, tickers and findings explicitly present in the
+  data below. Never invent, estimate or infer a ticker, price, metric or news
+  item that is not given to you.
+- If a section of data is empty, say so plainly rather than filling the space.
+- Where the data marks something as degraded or unavailable, say so in the
+  report. Do not write around a gap to make the analysis sound more complete
+  than it was.
+- Do not restate a recommendation as a directive. This is an advisory report
+  that a human adviser reviews before the client acts.
 
-1. Portfolio Health Check -- cite the actual sharpe_ratio, annual_return, \
-annual_volatility, and diversification_score, and explain the specific flaws \
-in plain language.
-2. Market Context -- cite the regime_label, confidence, and narrative.
-3. Recommendations -- for each approved candidate, explain what flaw it \
-addresses, why it fits the current market regime, cite its valuation \
-metrics, and state the specific recommended dollar allocation \
-(allocation_amount) and what fraction of the managed portfolio it represents \
-(allocation_pct -- this is a fraction of total portfolio value, NOT of net \
-worth; do not describe it as a share of net worth).
-4. What We Filtered Out and Why -- plainly summarize any suitability \
-violations that caused candidates or actions to be blocked/adjusted, so the \
-client understands the system applies real guardrails rather than blindly \
-recommending everything.
-5. Tax Notes -- summarize any wash-sale flags and tax efficiency notes in \
-plain language.
-6. Caveats & Disclaimers -- explicitly state this is an informational/ \
-educational report, not executed trades or individualized financial advice, \
-and that a human advisor should review it before the client acts on it.
+TONE:
+- Write for an intelligent client who is not a finance professional. Explain
+  what a number means, not just what it is.
+- Be direct about problems. A client whose portfolio is 50% in one stock is
+  better served by a clear sentence than a hedged one.
+- Do not congratulate the client, and do not editorialise about the market
+  beyond the regime data supplied.
+
+Produce EXACTLY these sections, with these headings:
+
+## 1. Summary
+Three or four sentences: what was found, what is recommended, what was
+withheld. Lead with the most consequential finding.
+
+## 2. Portfolio Health
+Cite the actual total value, concentration, sector and asset-class exposure,
+volatility, drawdown, correlation and diversification figures, and explain the
+specific findings in plain language.
+
+## 3. Market Context
+Cite the regime label, the confidence, and the specific signals that drove it.
+If confidence is low, say why that matters for the recommendations below.
+
+## 4. Recommended Changes
+For each proposed trade, state the action, the security, the dollar amount,
+which specific problem it addresses, and its estimated tax cost where given.
+Explain sells and trims as carefully as buys.
+
+## 5. What Was Withheld, and Why
+Every blocked recommendation, every deferred trade and every guardrail
+violation, with the reason for each. This section is the most important one in
+the report. Do not summarize it away or soften it.
+
+## 6. Tax Notes
+Wash-sale findings, harvesting opportunities, realized gains year to date.
+
+## 7. Limitations of This Analysis
+Anything the run could not do: unpriced positions, missing data, degraded
+steps. If nothing degraded, say the analysis ran on complete data.
 """
 
-HUMAN_PROMPT = """Here is the full structured state for this client, produced by the \
-upstream agents. Use ONLY this data.
 
-CLIENT PROFILE:
-{client_profile}
-
-PORTFOLIO DIAGNOSTICS:
-{portfolio_diagnostics}
-
-MARKET REGIME:
-{market_regime}
-
-SUITABILITY RESULT (approved candidates in adjusted_recommendations, filtered \
-items explained in violations):
-{suitability_result}
-
-TAX ASSESSMENT:
-{tax_assessment}
-
-Write the six-section client report now.
-"""
-
-
-def _build_prompt() -> ChatPromptTemplate:
-    return ChatPromptTemplate.from_messages(
-        [
-            ("system", SYSTEM_PROMPT),
-            ("human", HUMAN_PROMPT),
-        ]
-    )
-
-
-def _serialize_state_for_prompt(state: AgentState) -> Dict[str, str]:
-    import json
-
-    def _dump(value: Any) -> str:
-        if value is None:
-            return "null (not available)"
-        return json.dumps(value, indent=2, default=str)
-
+def _build_payload(state: AgentState) -> Dict[str, Any]:
+    """Everything the report may cite, and nothing else."""
     return {
-        "client_profile": _dump(state.get("client_profile")),
-        "portfolio_diagnostics": _dump(state.get("portfolio_diagnostics")),
-        "market_regime": _dump(state.get("market_regime")),
-        "suitability_result": _dump(state.get("suitability_result")),
-        "tax_assessment": _dump(state.get("tax_assessment")),
+        "client_profile": state.get("client_profile"),
+        "policy": state.get("policy"),
+        "portfolio_diagnostics": state.get("portfolio_diagnostics"),
+        "market_regime": state.get("market_regime"),
+        "suitability_result": state.get("suitability_result"),
+        "tax_assessment": state.get("tax_assessment"),
+        "rebalance_plan": state.get("rebalance_plan"),
+        "tax_blocked_recommendations": state.get("tax_blocked_recommendations"),
+        "guardrail_feedback": state.get("guardrail_feedback"),
+        "degradations": state.get("degradations"),
+        "data_as_of": state.get("data_as_of"),
     }
 
 
-def _call_llm(state: AgentState) -> str:
-    """Invoke the Gemini model. Raises on any failure -- caller handles the
-    fallback."""
-    # temperature=0.4: a touch of variation is fine for prose, and the
-    # grounding rules in the system prompt constrain the facts.
-    llm = get_chat_model(temperature=0.4)
-    prompt = _build_prompt()
-    chain = prompt | llm
-    inputs = _serialize_state_for_prompt(state)
-    response = invoke_with_retry(lambda: chain.invoke(inputs), what="Finance Report generation")
-    text = getattr(response, "content", None) or str(response)
-    if not text or not text.strip():
-        raise ValueError("LLM returned an empty report")
-    return text.strip()
+DISCLAIMER = """---
+
+**Important.** This report is produced by an automated analysis system for
+informational purposes. It is not individualized investment advice, and no
+trade described here has been executed. Any proposed transaction requires
+review and approval by a qualified human adviser before it is acted upon.
+Market data may be delayed. Tax figures are estimates computed from the
+holdings and transactions recorded in this system, are not tax advice, and do
+not account for your full tax circumstances -- consult a tax professional.
+Past performance does not predict future results, and all investing involves
+the risk of loss."""
 
 
-# --------------------------------------------------------------------------
-# Deterministic fallback -- no LLM required. Always succeeds given any
-# (possibly partial) state, so the graph never emits an empty final_report.
-# --------------------------------------------------------------------------
+def _fallback_report(state: AgentState, reason: str, detail: str) -> str:
+    """The deterministic report. Complete, and honest about what it is.
 
-def _fallback_health_check(diagnostics: Dict[str, Any]) -> str:
-    if not diagnostics:
-        return (
-            "Portfolio diagnostics are not available for this run, so a "
-            "detailed health check could not be produced."
-        )
-    lines = [
-        f"- Sharpe ratio: {diagnostics.get('sharpe_ratio', 'N/A')}",
-        f"- Annualized return: {_pct(diagnostics.get('annual_return', 0.0))}",
-        f"- Annualized volatility: {_pct(diagnostics.get('annual_volatility', 0.0))}",
-        f"- Diversification score: {diagnostics.get('diversification_score', 'N/A')}/100",
-    ]
-    flaws = diagnostics.get("flaws") or []
-    if flaws:
-        lines.append("")
-        lines.append("Specific issues identified in your current portfolio:")
-        for flaw in flaws:
-            lines.append(f"  * {flaw}")
-    else:
-        lines.append("")
-        lines.append("No specific portfolio flaws were flagged in this analysis.")
-    return "\n".join(lines)
-
-
-def _fallback_market_context(market_regime: Dict[str, Any]) -> str:
-    if not market_regime:
-        return "Market regime data is not available for this run."
-    label = market_regime.get("regime_label", "Unknown")
-    confidence = market_regime.get("confidence")
-    confidence_str = _pct(confidence) if isinstance(confidence, (int, float)) else "N/A"
-    narrative = market_regime.get("narrative", "")
-    lines = [
-        f"- Current regime classification: {label} (confidence: {confidence_str})",
-    ]
-    if narrative:
-        lines.append(f"- Narrative: {narrative}")
-    return "\n".join(lines)
-
-
-def _fallback_recommendations(suitability_result: Dict[str, Any]) -> str:
-    if not suitability_result:
-        return "No suitability-reviewed recommendations are available for this run."
-    candidates = suitability_result.get("adjusted_recommendations") or []
-    if not candidates:
-        return (
-            "No candidates cleared suitability review this cycle, so there are "
-            "no new recommendations to present."
-        )
-    lines = []
-    for c in candidates:
-        ticker = c.get("ticker", "UNKNOWN")
-        addresses = c.get("addresses_flaw", "not specified")
-        rationale = c.get("regime_fit_rationale", "not specified")
-        metrics = c.get("valuation_metrics") or {}
-        metrics_str = ", ".join(f"{k}={v}" for k, v in metrics.items()) or "no metrics provided"
-        confidence = c.get("confidence")
-        confidence_str = _pct(confidence) if isinstance(confidence, (int, float)) else "N/A"
-        allocation_amount = c.get("allocation_amount", 0.0)
-        allocation_pct = c.get("allocation_pct", 0.0)
-        lines.append(
-            f"- {ticker}: recommended allocation ${allocation_amount:,.0f} "
-            f"({_pct(allocation_pct)} of the portfolio, confidence: {confidence_str})"
-        )
-        lines.append(f"    Addresses: {addresses}")
-        lines.append(f"    Why it fits the current regime: {rationale}")
-        lines.append(f"    Valuation metrics: {metrics_str}")
-    return "\n".join(lines)
-
-
-def _fallback_filtered(suitability_result: Dict[str, Any]) -> str:
-    if not suitability_result:
-        return "No suitability review data is available for this run."
-    violations = suitability_result.get("violations") or []
-    approved = suitability_result.get("approved")
-    lines = [f"- Overall suitability approval: {'Yes' if approved else 'No'}"]
-    if violations:
-        lines.append("- The following items were filtered out or adjusted by the compliance/suitability guardrail:")
-        for v in violations:
-            lines.append(f"    * {v}")
-    else:
-        lines.append("- No candidates or actions were filtered out this cycle.")
-    return "\n".join(lines)
-
-
-def _fallback_tax_notes(tax_assessment: Dict[str, Any]) -> str:
-    if not tax_assessment:
-        return "No tax assessment data is available for this run."
-    wash_sale_flags = tax_assessment.get("wash_sale_flags") or []
-    notes = tax_assessment.get("tax_efficiency_notes") or []
-    lines = []
-    if wash_sale_flags:
-        lines.append(
-            "- The following tickers are currently blocked from repurchase under "
-            "the 30-day wash-sale rule: " + ", ".join(wash_sale_flags)
-        )
-    else:
-        lines.append("- No wash-sale restrictions currently apply.")
-    if notes:
-        lines.append("- Additional tax efficiency notes:")
-        for n in notes:
-            lines.append(f"    * {n}")
-    return "\n".join(lines)
-
-
-DISCLAIMER_TEXT = (
-    "This report is generated for informational and educational purposes only. "
-    "It does not constitute executed trades, a solicitation to buy or sell any "
-    "security, or individualized financial advice. All figures are drawn "
-    "directly from the automated analysis above and may not reflect real-time "
-    "market conditions. A qualified human financial advisor should review this "
-    "report before you act on any of it."
-)
-
-
-def _fallback_banner(error: Exception) -> str:
-    """Say plainly *why* the narrative is a template.
-
-    Distinguishing "no API key was ever configured" from "the model call
-    failed" matters: the first is a deployment mistake that will affect every
-    single run forever, the second is an incident. Collapsing both into
-    'the LLM call failed' is how a permanently dead AI layer goes unnoticed.
+    This is not a degraded stub: it contains every finding, every
+    recommendation, every withheld item and every tax note the model version
+    would have covered. What it lacks is the synthesis -- and the banner says
+    exactly that, distinguishing a missing API key from a failed call, because
+    those need different responses from whoever is reading.
     """
-    from services.llm import LLMUnavailable
-
-    if isinstance(error, LLMUnavailable):
-        return (
-            "[Note: no Gemini API key is configured, so this report -- and the market "
-            "regime call and stock ranking behind it -- were produced by the system's "
-            "deterministic, non-AI fallbacks. Set GEMINI_API_KEY to enable the "
-            "LLM-backed analysis.]"
-        )
-    return (
-        "[Note: this report was generated by the deterministic fallback template "
-        f"because the model call failed after {settings.LLM_MAX_ATTEMPTS} attempt(s): {error!r}]"
-    )
-
-
-def _assemble_fallback_report(state: AgentState, error: Exception) -> str:
     profile = state.get("client_profile") or {}
-    client_id = profile.get("client_id", "unknown")
-    risk_tolerance = profile.get("risk_tolerance", "unknown")
-    horizon = profile.get("time_horizon_years", "unknown")
-
     diagnostics = state.get("portfolio_diagnostics") or {}
-    market_regime = state.get("market_regime") or {}
-    suitability_result = state.get("suitability_result") or {}
-    tax_assessment = state.get("tax_assessment") or {}
+    regime = state.get("market_regime") or {}
+    suitability = state.get("suitability_result") or {}
+    tax = state.get("tax_assessment") or {}
+    plan = state.get("rebalance_plan") or {}
+    policy = state.get("policy") or {}
+    blocked = state.get("tax_blocked_recommendations") or []
+    degradations = state.get("degradations") or []
 
-    sections = [
-        f"WEALTH REPORT -- Client #{client_id}",
-        f"(Risk tolerance: {risk_tolerance}; time horizon: {horizon} years)",
+    if reason == "no_api_key":
+        banner = (
+            "> **This report was generated without a language model.** No API key is "
+            "configured on this deployment, so the narrative below is assembled directly "
+            "from the analysis rather than written by a model. Every number, finding and "
+            "guardrail decision is real and was produced by the same deterministic "
+            "analysis either way -- what is missing is the written synthesis, not the "
+            "substance."
+        )
+    else:
+        banner = (
+            f"> **This report was generated without a language model.** The model call "
+            f"failed ({detail}), so the narrative below is assembled directly from the "
+            f"analysis. Every number, finding and guardrail decision is real; the written "
+            f"synthesis is absent. This is worth investigating -- it means the AI layer is "
+            f"not currently working."
+        )
+
+    lines: List[str] = [
+        "# Portfolio Analysis",
         "",
-        _fallback_banner(error),
+        banner,
         "",
-        "1. PORTFOLIO HEALTH CHECK",
-        _fallback_health_check(diagnostics),
+        f"Prepared for **{profile.get('name', 'this client')}** on "
+        f"{utcnow().strftime('%d %B %Y')}.",
         "",
-        "2. MARKET CONTEXT",
-        _fallback_market_context(market_regime),
-        "",
-        "3. RECOMMENDATIONS",
-        _fallback_recommendations(suitability_result),
-        "",
-        "4. WHAT WE FILTERED OUT AND WHY",
-        _fallback_filtered(suitability_result),
-        "",
-        "5. TAX NOTES",
-        _fallback_tax_notes(tax_assessment),
-        "",
-        "6. CAVEATS & DISCLAIMERS",
-        DISCLAIMER_TEXT,
     ]
-    return "\n".join(sections)
 
+    recommendations = suitability.get("adjusted_recommendations") or []
+    proposals = plan.get("proposals") or []
+    flaws = diagnostics.get("flaws") or []
 
-# --------------------------------------------------------------------------
-# Node entry point
-# --------------------------------------------------------------------------
+    # --- 1. Summary ---
+    lines += ["## 1. Summary", ""]
+    summary_bits = []
+    if flaws:
+        summary_bits.append(f"The analysis identified {len(flaws)} finding(s), the most "
+                            f"significant being: {flaws[0]}")
+    else:
+        summary_bits.append("No policy breaches or material findings were identified.")
+    if proposals:
+        sells = plan.get("sell_count", 0)
+        buys = plan.get("buy_count", 0)
+        summary_bits.append(
+            f"{sells} sale(s) and {buys} purchase(s) are proposed, totalling "
+            f"{_money(plan.get('gross_notional'))} of trading."
+        )
+    else:
+        summary_bits.append("No trades are proposed.")
+    if blocked:
+        summary_bits.append(
+            f"{len(blocked)} recommendation(s) were withheld on tax grounds: "
+            f"{', '.join(blocked)}."
+        )
+    lines += [" ".join(summary_bits), ""]
+
+    # --- 2. Portfolio Health ---
+    lines += [
+        "## 2. Portfolio Health",
+        "",
+        f"- Total value: {_money(diagnostics.get('total_value'))} "
+        f"({_money(diagnostics.get('cash'))} in cash)",
+        f"- Annualised return: {_pct(diagnostics.get('annual_return'))}",
+        f"- Annualised volatility: {_pct(diagnostics.get('annual_volatility'))}",
+        f"- Sharpe ratio: {diagnostics.get('sharpe_ratio') if diagnostics.get('sharpe_ratio') is not None else 'not available'}",
+        f"- Largest peak-to-trough decline: {_pct(diagnostics.get('max_drawdown'))}",
+        f"- Portfolio beta: {diagnostics.get('portfolio_beta') if diagnostics.get('portfolio_beta') is not None else 'not available'}",
+        f"- Diversification score: {diagnostics.get('diversification_score', 0):.0f}/100"
+        + (
+            f", behaving like roughly {diagnostics['effective_positions']:.1f} equally-sized positions"
+            if diagnostics.get("effective_positions")
+            else ""
+        ),
+    ]
+    if diagnostics.get("average_correlation") is not None:
+        lines.append(
+            f"- Average correlation between holdings: {diagnostics['average_correlation']:.2f}"
+        )
+    lines.append("")
+
+    if flaws:
+        lines += ["**Findings:**", ""]
+        lines += [f"{index}. {flaw}" for index, flaw in enumerate(flaws, start=1)]
+    else:
+        lines.append("No findings: the portfolio is within every limit in the client's policy.")
+    lines.append("")
+
+    # --- 3. Market Context ---
+    lines += [
+        "## 3. Market Context",
+        "",
+        f"**Regime: {regime.get('regime_label', 'unknown')}** "
+        f"(confidence {regime.get('confidence', 0) * 100:.0f}%)",
+        "",
+        regime.get("narrative", "No market regime assessment was produced."),
+        "",
+    ]
+    if (regime.get("confidence") or 0) < 0.3:
+        lines += [
+            "Confidence in this assessment is low, which means the recommendations below "
+            "rest mainly on portfolio construction and valuation rather than on a market "
+            "view. That is the intended behaviour when the signals do not agree.",
+            "",
+        ]
+
+    # --- 4. Recommended Changes ---
+    lines += ["## 4. Recommended Changes", ""]
+    if proposals:
+        for proposal in sorted(proposals, key=lambda p: p.get("sequence", 0)):
+            tax_cost = proposal.get("estimated_tax_cost")
+            lines.append(
+                f"### {proposal['side']} {proposal['symbol']} — "
+                f"{_money(proposal.get('notional'))}"
+            )
+            lines.append("")
+            lines.append(proposal.get("rationale", ""))
+            if proposal.get("addresses_flaw"):
+                lines.append("")
+                lines.append(f"*Addresses:* {proposal['addresses_flaw']}")
+            if tax_cost:
+                lines.append("")
+                lines.append(f"*Estimated tax cost:* {_money(tax_cost)}")
+            lines.append("")
+    elif recommendations:
+        for recommendation in recommendations:
+            lines.append(
+                f"### {recommendation['ticker']} — "
+                f"{_money(recommendation.get('allocation_amount'))} "
+                f"({_pct(recommendation.get('allocation_pct'))} of the portfolio)"
+            )
+            lines.append("")
+            lines.append(f"*Addresses:* {recommendation.get('addresses_flaw', 'not stated')}")
+            lines.append("")
+            lines.append(recommendation.get("regime_fit_rationale", ""))
+            lines.append("")
+    else:
+        lines += [
+            "No changes are recommended. Either the portfolio is already within its policy, "
+            "or every candidate considered was withheld by a guardrail -- see the next "
+            "section.",
+            "",
+        ]
+
+    # --- 5. What Was Withheld ---
+    lines += ["## 5. What Was Withheld, and Why", ""]
+    withheld_any = False
+
+    if blocked:
+        withheld_any = True
+        lines += [
+            "**Blocked on tax grounds.** These securities passed every suitability check "
+            "and were still not recommended:",
+            "",
+        ]
+        for detail in tax.get("wash_sale_detail") or []:
+            lines.append(f"- **{detail['symbol']}**: {detail['reason']}")
+        for ticker in blocked:
+            if not any(d.get("symbol") == ticker for d in (tax.get("wash_sale_detail") or [])):
+                lines.append(f"- **{ticker}**: withheld by the wash-sale guardrail.")
+        lines += [
+            "",
+            "The money that would have gone into these positions has not been quietly "
+            "moved elsewhere. This run deploys less, and says so.",
+            "",
+        ]
+
+    violations = suitability.get("violations") or []
+    if violations:
+        withheld_any = True
+        lines += ["**Rejected by the suitability guardrail:**", ""]
+        lines += [f"- {violation}" for violation in violations]
+        lines.append("")
+
+    deferred = plan.get("deferred") or []
+    if deferred:
+        withheld_any = True
+        lines += ["**Deferred for human judgement:**", ""]
+        for entry in deferred:
+            label = entry.get("symbol") or entry.get("asset_class") or "position"
+            lines.append(f"- **{label}**: {entry.get('reason')}")
+        lines.append("")
+
+    for note in plan.get("notes") or []:
+        withheld_any = True
+        lines.append(f"- {note}")
+    if plan.get("notes"):
+        lines.append("")
+
+    if not withheld_any:
+        lines += ["Nothing was withheld. Every candidate considered passed every guardrail.", ""]
+
+    # --- 6. Tax Notes ---
+    lines += ["## 6. Tax Notes", ""]
+    for note in tax.get("tax_efficiency_notes") or ["No tax observations for this client."]:
+        lines.append(f"- {note}")
+    lines.append("")
+
+    # --- 7. Limitations ---
+    lines += ["## 7. Limitations of This Analysis", ""]
+    degradation_text = summarize_degradations(degradations)
+    if degradation_text:
+        lines += [degradation_text, ""]
+    else:
+        lines += ["This analysis ran on complete data with no degraded steps.", ""]
+
+    if policy.get("source") != "policy":
+        lines += [
+            "This client has no approved Investment Policy Statement on file. The limits "
+            f"applied above are the system's built-in defaults for a "
+            f"{policy.get('risk_tier', 'Moderate')} mandate and have not been reviewed or "
+            "agreed. Recording an approved policy would make these limits an explicit, "
+            "auditable agreement rather than an assumption.",
+            "",
+        ]
+
+    if state.get("data_as_of"):
+        lines += [f"Market data as of {state['data_as_of']}.", ""]
+
+    lines.append(DISCLAIMER)
+    return "\n".join(lines)
+
 
 def finance_report_node(state: AgentState) -> dict:
-    started_at = _now_iso()
-    error_detail = None
+    """Write the client-facing report."""
+    report: Optional[str] = None
 
-    try:
-        report = _call_llm(state)
-        status = "success"
-        summary = "Generated client-facing report via Gemini LLM."
-    except Exception as exc:  # noqa: BLE001 -- node must never crash the graph
-        from services.llm import LLMUnavailable
+    with node_run(NODE_NAME, state) as ctx:
+        ctx.prompt_version = PROMPT_VERSION
+        ctx.temperature = 0.4
 
-        status = "error"
-        error_detail = repr(exc)
-        if isinstance(exc, LLMUnavailable):
-            summary = "No GEMINI_API_KEY configured; used deterministic fallback template."
-        else:
-            summary = "Gemini LLM call failed; used deterministic fallback template instead."
-        logger.warning("[Finance Report] %s", summary)
-        report = _assemble_fallback_report(state, exc)
+        payload = _build_payload(state)
 
-    record: AgentRunRecord = {
-        "node_name": NODE_NAME,
-        "started_at": started_at,
-        "completed_at": _now_iso(),
-        "status": status,
-        "summary": summary,
-        "error_detail": error_detail,
-    }
+        try:
+            llm = get_chat_model(temperature=0.4)
+            prompt = (
+                SYSTEM_PROMPT
+                + "\n\nHere is the complete analysis. Use only this data.\n\n"
+                + json.dumps(payload, indent=2, default=str)
+            )
+            response, usage = invoke_tracked(
+                lambda: llm.invoke(prompt), node=NODE_NAME
+            )
+            ctx.record_usage(usage)
+            ctx.model_used = settings.GEMINI_MODEL
+            text = getattr(response, "content", str(response)).strip()
+            if not text:
+                raise ValueError("The model returned an empty report.")
 
-    return {"final_report": report, "audit_trail": [record]}
+            degradation_text = summarize_degradations(state.get("degradations") or [])
+            if degradation_text:
+                # Appended deterministically rather than trusted to the model.
+                # A model asked to disclose its own limitations sometimes
+                # softens them, and this is the section that must not be soft.
+                text += "\n\n---\n\n### Data limitations\n\n" + degradation_text
+            report = text + "\n\n" + DISCLAIMER
 
+        except LLMUnavailable as exc:
+            report = _fallback_report(state, "no_api_key", str(exc))
+            ctx.degrade(
+                reason="no_api_key",
+                detail=str(exc),
+                impact=(
+                    "This report was assembled from the analysis rather than written by a "
+                    "language model, because none is configured. The findings and figures "
+                    "are unaffected."
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 -- a report must always be produced
+            reason = classify_failure(exc)
+            report = _fallback_report(state, reason, f"{type(exc).__name__}: {exc}")
+            ctx.degrade(
+                reason=reason,
+                detail=f"{type(exc).__name__}: {exc}",
+                impact=(
+                    "This report was assembled from the analysis rather than written by a "
+                    "language model, because the model call failed. The findings and "
+                    "figures are unaffected."
+                ),
+            )
 
-if __name__ == "__main__":
-    import json
+        ctx.output_snapshot = {
+            "characters": len(report or ""),
+            "llm_written": not ctx.degraded,
+            "disclosure_version": DISCLOSURE_VERSION,
+        }
+        ctx.summary = (
+            f"{'Model-written' if not ctx.degraded else 'Deterministic'} report, "
+            f"{len(report or '')} characters."
+        )
+        logger.info("[Report] %s", ctx.summary)
 
-    sample_state: AgentState = {
-        "run_id": "smoke-test-run-001",
-        "client_profile": {
-            "client_id": 42,
-            "age": 57,
-            "risk_tolerance": "Moderate",
-            "time_horizon_years": 10,
-            "goals": ["Retirement", "College funding"],
-            "holdings": {
-                "AAPL": 420000.0,
-                "MSFT": 85000.0,
-                "CASH": 45000.0,
-            },
-            "net_worth": 550000.0,
-        },
-        "portfolio_diagnostics": {
-            "concentration": {"AAPL": 0.7636, "MSFT": 0.1545, "CASH": 0.0818},
-            "sector_exposure": {"Technology": 0.9998, "Unknown": 0.0002},
-            "sharpe_ratio": 0.42,
-            "annual_return": 0.081,
-            "annual_volatility": 0.29,
-            "diversification_score": 24.3,
-            "flaws": [
-                "AAPL is 76.4% of the portfolio -- exceeds the 25.0% concentration limit for a Moderate risk tolerance",
-                "Technology sector is 100.0% of non-cash holdings -- exceeds the 50.0% sector concentration threshold",
-            ],
-            "market_data_tickers": ["AAPL", "MSFT"],
-        },
-        "market_regime": {
-            "regime_label": "Late-cycle",
-            "confidence": 0.68,
-            "supporting_signals": {"10y2y_spread": -0.12, "vix": 22.4},
-            "narrative": (
-                "Yield curve inversion and elevated volatility suggest we are "
-                "late in the economic cycle; defensive positioning and "
-                "diversification are favored over further concentration in "
-                "high-beta growth names."
-            ),
-        },
-        "candidate_stocks": [
-            {
-                "ticker": "JNJ",
-                "valuation_metrics": {"pe_ratio": 15.2, "peg_ratio": 2.1, "dividend_yield": 0.031},
-                "addresses_flaw": "AAPL is 76.4% of the portfolio -- exceeds the 25.0% concentration limit for a Moderate risk tolerance",
-                "regime_fit_rationale": "Defensive healthcare name with stable cash flows, appropriate for late-cycle positioning.",
-                "confidence": 0.74,
-            },
-            {
-                "ticker": "SOXL",
-                "valuation_metrics": {"pe_ratio": 41.0, "peg_ratio": 3.4},
-                "addresses_flaw": "AAPL is 76.4% of the portfolio -- exceeds the 25.0% concentration limit for a Moderate risk tolerance",
-                "regime_fit_rationale": "Leveraged semiconductor exposure -- high risk, does not fit late-cycle defensive posture.",
-                "confidence": 0.31,
-            },
-        ],
-        "suitability_result": {
-            "approved": True,
-            "violations": [
-                "SOXL rejected: 3x leveraged ETF exceeds volatility limits for a Moderate risk tolerance client",
-            ],
-            "adjusted_recommendations": [
-                {
-                    "ticker": "JNJ",
-                    "valuation_metrics": {"pe_ratio": 15.2, "peg_ratio": 2.1, "dividend_yield": 0.031},
-                    "addresses_flaw": "AAPL is 76.4% of the portfolio -- exceeds the 25.0% concentration limit for a Moderate risk tolerance",
-                    "regime_fit_rationale": "Defensive healthcare name with stable cash flows, appropriate for late-cycle positioning.",
-                    "confidence": 0.74,
-                },
-            ],
-        },
-        "tax_assessment": {
-            "wash_sale_flags": ["MSFT"],
-            "tax_efficiency_notes": [
-                "MSFT was sold at a loss 18 days ago; repurchasing now would trigger a wash-sale disallowance -- wait until the 30-day window closes.",
-                "AAPL has a large unrealized long-term gain; trimming the position would be more tax-efficient after 12 months of holding than a short-term sale.",
-            ],
-        },
-        "final_report": None,
-        "audit_trail": [],
-        "requires_human_approval": False,
-        "human_approved": None,
-        "research_attempts": 0,
-        "needs_research_retry": False,
-    }
+    if report is None:
+        report = _fallback_report(state, "node_exception", "the report node failed")
 
-    print("Running finance_report_node against a fully-populated sample AgentState...")
-    print(f"(GEMINI_API_KEY configured: {settings.GEMINI_API_KEY!r} -- dummy key expected to fail the live call)")
-    print()
-
-    result = finance_report_node(sample_state)
-
-    print("=== audit_trail ===")
-    print(json.dumps(result["audit_trail"], indent=2))
-    print()
-    print("=== final_report ===")
-    print(result["final_report"])
+    return finish(ctx, {"final_report": report})

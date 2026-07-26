@@ -1,433 +1,406 @@
+"""Suitability guardrail: the gate between "good idea" and "client-facing".
+
+Deterministic, rule-based, no LLM anywhere in this file. That is the single
+most important design decision in the system. A model that is right 97% of the
+time is a useful research analyst and an unacceptable control: the 3% is
+exactly the case a control exists to catch, and "the model judged it suitable"
+is not an answer to a regulator asking why a client was sold something
+unsuitable.
+
+Every rule here resolves from the client's versioned Investment Policy
+Statement rather than a module constant, so the limits that produced a
+decision can be recovered later, along with who approved them and when.
+
+Failure direction is deliberate and differs by rule:
+
+* **Security quality fails closed.** An unverifiable security is not
+  recommended. If no provider can tell us the market cap or listing venue of
+  something, that is a reason to decline, not to proceed hopefully.
+* **Beta fails open.** Beta is genuinely missing for many legitimate
+  instruments, so an absent value skips that check rather than rejecting the
+  name. Failing closed here would exclude most bond funds from every
+  conservative portfolio -- the opposite of the intent.
+
+Sizing lives here too, because sizing *is* a suitability decision. Cash is
+distributed by confidence, capped per position by policy, and constrained so
+the result does not breach the sector limit or drain the cash floor -- the
+three ways a correctly-chosen security can still be the wrong trade.
 """
-Suitability / Compliance Guardrail Agent.
 
-Deterministic, rule-based compliance gate for candidate stock recommendations.
-NO LLM calls anywhere in this file -- every check here must be auditable,
-reproducible rule evaluation, because this is the gate between "the system
-thinks this is a good idea" and "this becomes part of a client-facing
-recommendation" for a system that (eventually) touches real portfolios.
+from typing import Any, Dict, List, Optional, Tuple
 
-Replaces the legacy `agents/compliance_critic.py`, which had exactly two
-low-quality rules:
-  1. A literal string match banning the ticker "DOGE" as its only "penny
-     stock"/security-quality check.
-  2. A flat 30%-of-net-worth position cap that ignored the client's risk
-     tolerance, age, or time horizon entirely.
-
-Both are replaced below with real, client-profile-driven logic backed by live
-yfinance data.
-
-Control-flow pattern KEPT from the legacy module: evaluate a list of proposed
-changes (here, `candidate_stocks`), collect a list of human-readable violation
-strings, and gate on whether that list is empty. The one deliberate behavioral
-change: the legacy gate raised an exception on any violation, which is correct
-for a live-trading gate where a bad trade must never execute. This system only
-produces advisory reports/recommendations -- nothing here executes a trade --
-so a per-candidate rejection is logged and the candidate is filtered out, not
-treated as fatal. `approved` is True as long as at least one candidate
-survives every check (not all-or-nothing).
-"""
-
-import os
-import sys
-import traceback
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
-# When this file is run directly (`python agents/suitability.py`), Python
-# puts only this file's own directory (agents/) on sys.path, not the repo
-# root -- so the root-level `state.py` wouldn't be importable. Insert the
-# repo root explicitly so both `python agents/suitability.py` and normal
-# package imports (`from agents.suitability import suitability_node`) work.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+from db import ClientProfile as ClientProfileModel
+from db import SessionLocal
 from logging_setup import get_logger
-from services.market_data import get_ticker_info
-from state import AgentRunRecord, AgentState, Candidate, SuitabilityResult
+from metrics import guardrail_blocks
+from services.market_data import get_security_info
+from services.policy import resolve as resolve_policy
+from services.portfolio import load_portfolio
+from state import AgentState, Candidate, SuitabilityResult
+
+from agents.runtime import finish, node_run
 
 logger = get_logger(__name__)
 
-# --- Rule 2 thresholds -------------------------------------------------------
-# Risk-tier position caps and the portfolio base they are measured against
-# both live in agents/limits.py, shared with the Portfolio Diagnostics agent.
-# See that module for why the denominator had to be unified, not just the
-# percentages.
-from agents.limits import (  # noqa: E402 -- after the sys.path bootstrap above
-    portfolio_base_value,
-    position_cap_fraction,
-)
+NODE_NAME = "suitability"
 
-# --- Rule 1 thresholds --------------------------------------------------------
-MIN_MARKET_CAP = 2_000_000_000  # $2B small-cap/microcap threshold
+# Exchange codes as actually returned by the provider layer. Verified against
+# live tickers:
+#   NMS/NGM/NCM = Nasdaq tiers, NYQ = NYSE, ASE = NYSE American,
+#   PCX = NYSE Arca (most ETFs), BATS = Cboe BZX.
+# The OTC tiers that must be rejected are PNK (pink sheets), OQX/OQB (OTCQX,
+# OTCQB) and OID (foreign ADRs on OTC Markets).
+MAJOR_EXCHANGES = {"NMS", "NGM", "NCM", "NYQ", "ASE", "PCX", "BATS", "ARCA", "NYSE", "NASDAQ"}
 
-# Exchange codes as ACTUALLY returned by yfinance's `Ticker.info["exchange"]`
-# field. Verified live against real tickers while building this module:
-#   NMS = Nasdaq Global Select Market  (AAPL, MSFT, SIRI all returned "NMS")
-#   NYQ = New York Stock Exchange      (JNJ, KO, GME, IONQ all returned "NYQ")
-#   PCX = NYSE Arca                    (SPY -- mostly ETFs)
-#   NGM = Nasdaq Global Market, NCM = Nasdaq Capital Market, ASE = NYSE
-#         American (formerly AMEX) -- not hit in the live sample above, but
-#         documented Nasdaq/NYSE tiers, included as major exchanges.
-# Confirmed OTC / pink-sheet codes that MUST be rejected (also verified live):
-#   PNK = OTC Markets Pink Sheets      (SIRC, BBIG both returned "PNK",
-#                                        fullExchangeName "OTC Markets OTCPK")
-#   OQX = OTC Markets OTCQX            (BAYRY returned "OQX")
-#   OID = OTC Markets OTCID (foreign ADRs) (NSRGY returned "OID")
-#   OQB = OTC Markets OTCQB (documented OTC tier, not separately spot-checked)
-MAJOR_EXCHANGES = {"NMS", "NGM", "NCM", "NYQ", "ASE", "PCX", "BATS"}
-
-# --- Rule 3 thresholds --------------------------------------------------------
-AGE_THRESHOLD = 60
-HORIZON_THRESHOLD_YEARS = 5
-MAX_BETA_NEAR_RETIREMENT = 1.5
+# The rule applies to clients at or near the point of drawing on the
+# portfolio, where a deep drawdown cannot be waited out.
+NEAR_RETIREMENT_AGE = 60
+SHORT_HORIZON_YEARS = 5
 
 
-def _fetch_info(ticker: str) -> Optional[Dict[str, Any]]:
-    """Best-effort fetch of yfinance's `.info` dict for a ticker.
+def _reject(ticker: str, rule: str, reason: str) -> str:
+    """Format a rejection.
 
-    Delegates to the shared, TTL-cached lookup in services.market_data so
-    that a symbol already screened by Stock Research this run is not fetched
-    over the network a second time. Returns None on any failure so callers
-    can treat "couldn't verify" as its own explicit case.
+    The `TICKER: rejected -- ...` shape is load-bearing: the guardrail gate
+    parses the leading token to build the exclusion list that makes the retry
+    loop do something different on its next pass. Changing this format
+    silently turns the retry into an expensive no-op, which is exactly what
+    happened before, so the parse is also defended on the gate side.
     """
-    return get_ticker_info(ticker)
+    guardrail_blocks.labels(rule).inc()
+    return f"{ticker}: rejected -- {reason}"
 
 
-def _check_security_quality(ticker: str, info: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Rule 1: reject micro/small caps and OTC/pink-sheet listings.
+def _check_security_quality(candidate: Candidate, policy) -> Optional[str]:
+    """Size, liquidity and listing venue. Fails closed on missing data."""
+    ticker = candidate["ticker"]
+    info = get_security_info(ticker)
 
-    Replaces the legacy hardcoded `asset == "DOGE"` string match. If we
-    can't fetch verifiable quality data at all, that itself is a violation --
-    we do not silently let unverifiable tickers through.
-    """
     if info is None:
-        return f"{ticker}: rejected -- could not fetch verifiable market data (yfinance info unavailable)."
-
-    market_cap = info.get("marketCap")
-    exchange = info.get("exchange")
-
-    if market_cap is None:
-        return f"{ticker}: rejected -- market cap unavailable, cannot verify security quality."
-    if market_cap < MIN_MARKET_CAP:
-        return (
-            f"{ticker}: rejected -- market cap ${market_cap:,.0f} is below the "
-            f"${MIN_MARKET_CAP:,.0f} small-cap/microcap threshold."
+        return _reject(
+            ticker, "unverifiable",
+            "no market data provider could return verifiable reference data for this "
+            "security, so its quality cannot be confirmed.",
         )
-    if exchange is None:
-        return f"{ticker}: rejected -- exchange listing unavailable, cannot verify it trades on a major exchange."
-    if exchange not in MAJOR_EXCHANGES:
-        return (
-            f"{ticker}: rejected -- listed on '{exchange}' "
-            f"({info.get('fullExchangeName', 'unknown exchange')}), not a major exchange (NYSE/NASDAQ)."
+
+    is_fund = (info.quote_type or "").upper() in ("ETF", "MUTUALFUND")
+
+    if not is_fund:
+        if info.market_cap is None:
+            return _reject(
+                ticker, "unverifiable",
+                "market capitalisation is unavailable, so security quality cannot be verified.",
+            )
+        if info.market_cap < policy.min_market_cap:
+            return _reject(
+                ticker, "min_market_cap",
+                f"market cap of ${info.market_cap:,.0f} is below this client's "
+                f"${policy.min_market_cap:,.0f} minimum.",
+            )
+
+    if info.exchange is None:
+        return _reject(
+            ticker, "unverifiable",
+            "the listing venue is unavailable, so it cannot be confirmed to trade on a "
+            "major exchange.",
+        )
+    if info.exchange.upper() not in MAJOR_EXCHANGES:
+        return _reject(
+            ticker, "exchange",
+            f"it is listed on '{info.exchange}', not a major US exchange. Over-the-counter "
+            f"listings carry disclosure and liquidity risks this mandate does not accept.",
+        )
+
+    if (
+        info.avg_dollar_volume is not None
+        and info.avg_dollar_volume < policy.min_avg_dollar_volume
+    ):
+        return _reject(
+            ticker, "liquidity",
+            f"average daily turnover of ${info.avg_dollar_volume:,.0f} is below the "
+            f"${policy.min_avg_dollar_volume:,.0f} floor; a client-sized position could not "
+            f"be exited without moving the price.",
         )
     return None
 
 
-MIN_ALLOCATION_DOLLARS = 100.0
+def _check_policy_exclusions(candidate: Candidate, policy) -> Optional[str]:
+    """Explicit client and firm prohibitions."""
+    ticker = candidate["ticker"]
+    if ticker.upper() in {t.upper() for t in policy.excluded_tickers}:
+        return _reject(ticker, "policy_exclusion", "it is on this client's exclusion list.")
+
+    sector = candidate.get("sector")
+    if sector and sector in set(policy.excluded_sectors):
+        return _reject(
+            ticker, "sector_exclusion",
+            f"the {sector} sector is excluded by this client's policy.",
+        )
+
+    asset_class = candidate.get("asset_class")
+    if policy.allowed_asset_classes and asset_class not in policy.allowed_asset_classes:
+        return _reject(
+            ticker, "asset_class",
+            f"the {asset_class} asset class is not permitted by this client's policy.",
+        )
+    return None
+
+
+def _check_risk_fit(candidate: Candidate, policy, profile: Dict[str, Any]) -> Optional[str]:
+    """Beta ceiling for near-retirement or short-horizon clients.
+
+    Skipped when beta is unavailable. Unlike the quality checks, failing
+    closed here would reject most bond and international funds -- precisely
+    the instruments a conservative mandate needs.
+    """
+    ticker = candidate["ticker"]
+    info = get_security_info(ticker)
+    beta = info.beta if info else None
+    if beta is None:
+        return None
+
+    if policy.max_position_beta is not None and beta > policy.max_position_beta:
+        return _reject(
+            ticker, "beta_policy",
+            f"beta of {beta:.2f} exceeds the {policy.max_position_beta:.2f} ceiling in this "
+            f"client's {policy.risk_tier} policy.",
+        )
+
+    age = profile.get("age") or 0
+    horizon = profile.get("time_horizon_years") or 99
+    if age >= NEAR_RETIREMENT_AGE or horizon <= SHORT_HORIZON_YEARS:
+        if beta > 1.5:
+            return _reject(
+                ticker, "beta_horizon",
+                f"beta of {beta:.2f} is too high for a client aged {age} with a "
+                f"{horizon}-year horizon; there is not enough time to recover from a "
+                f"drawdown that a position this sensitive would deepen.",
+            )
+    return None
 
 
 def _compute_allocations(
     candidates: List[Candidate],
-    client_profile: Dict[str, Any],
-) -> Dict[str, float]:
-    """Rule 2 + sizing: decide how many actual dollars to put into each
-    surviving candidate, replacing the legacy flat 30%-of-net-worth cap AND
-    the old "does this cross a limit" yes/no check with a real portfolio-
-    construction decision.
+    view,
+    policy,
+) -> Tuple[Dict[str, float], List[str]]:
+    """Distribute investable cash across approved candidates.
 
-    Available CASH is distributed across candidates weighted by each
-    candidate's confidence score (equal-weighted if every confidence is 0),
-    with each ticker capped at the client's risk-tier position limit (as a
-    fraction of the managed portfolio's value, net of any existing holding in
-    that symbol). Cash that would overflow a capped-out ticker is
-    redistributed across the remaining open tickers in further passes (simple
-    water-filling), so available cash gets used even when confidence is
-    skewed toward a name that's already near its cap.
+    Water-filling, weighted by confidence: each candidate's share is capped by
+    its remaining position headroom, and cash that overflows a capped name is
+    redistributed to the others rather than abandoned. Converges in a handful
+    of passes for realistic candidate counts.
+
+    Two constraints beyond the position cap, both of which the previous
+    version omitted and both of which turn a good pick into a bad trade:
+
+    * The **cash floor** is reserved first. Deploying the entire balance
+      creates the liquidity flaw diagnostics warns about on the next run.
+    * The **sector cap** is enforced as the basket is built, so five names
+      that are individually fine do not collectively breach a sector limit.
     """
-    holdings = client_profile.get("holdings", {})
-    available_cash = holdings.get("CASH", 0.0)
-    # Measured against the same base Portfolio Diagnostics uses for its
-    # concentration flaws -- see agents/limits.py.
-    base_value = portfolio_base_value(client_profile)
-    cap_fraction = position_cap_fraction(client_profile.get("risk_tolerance", "Moderate"))
-
+    notes: List[str] = []
     tickers = [c["ticker"] for c in candidates]
     allocation = {t: 0.0 for t in tickers}
-    if not tickers or available_cash <= 0 or base_value <= 0:
-        return allocation
+    if not tickers:
+        return allocation, notes
 
-    cap_dollar = cap_fraction * base_value
-    max_amount = {t: max(0.0, cap_dollar - holdings.get(t, 0.0)) for t in tickers}
+    total = view.total_value
+    investable = max(0.0, min(view.cash - policy.min_cash_pct * total, view.spendable_cash))
+    if investable < policy.min_position_notional or total <= 0:
+        notes.append(
+            f"No allocation was made: ${investable:,.0f} is investable after reserving the "
+            f"{policy.min_cash_pct:.0%} cash floor, below the "
+            f"${policy.min_position_notional:,.0f} minimum position size."
+        )
+        return allocation, notes
 
-    confidences = {c["ticker"]: max(c.get("confidence", 0.0), 0.0) for c in candidates}
-    total_conf = sum(confidences.values())
+    current_weights = view.weights()
+    cap_dollars = policy.max_position_pct * total
+    headroom = {
+        t: max(0.0, cap_dollars - current_weights.get(t, 0.0) * total) for t in tickers
+    }
+
+    # Sector budget, tracked as the basket is assembled.
+    invested = view.invested_value
+    sector_value: Dict[str, float] = {}
+    for holding in view.holdings:
+        if view.is_diversified_fund(holding):
+            continue
+        key = holding.sector or "Unclassified"
+        sector_value[key] = sector_value.get(key, 0.0) + holding.market_value
+
+    sectors = {
+        c["ticker"]: (c.get("sector") if c.get("security_type") not in ("etf", "fund") else None)
+        for c in candidates
+    }
+
+    confidences = {c["ticker"]: max(float(c.get("confidence") or 0.0), 0.0) for c in candidates}
+    total_confidence = sum(confidences.values())
     weight = (
-        {t: v / total_conf for t, v in confidences.items()}
-        if total_conf > 0
+        {t: v / total_confidence for t, v in confidences.items()}
+        if total_confidence > 0
+        # Equal weight when nothing has a confidence -- which happens on the
+        # deterministic path, and is the honest response to having no ranking
+        # signal rather than an arbitrary ordering.
         else {t: 1.0 / len(tickers) for t in tickers}
     )
 
-    remaining_cash = available_cash
+    remaining = investable
     open_tickers = set(tickers)
-    for _ in range(5):  # water-filling passes -- converges fast for <=5 candidates
-        if remaining_cash <= 0 or not open_tickers:
+    for _ in range(6):
+        if remaining <= 1e-6 or not open_tickers:
             break
-        open_weight_sum = sum(weight[t] for t in open_tickers)
-        if open_weight_sum <= 0:
+        open_weight = sum(weight[t] for t in open_tickers)
+        if open_weight <= 0:
             break
         distributed = 0.0
         newly_capped = []
-        for t in list(open_tickers):
-            share = remaining_cash * (weight[t] / open_weight_sum)
-            room = max_amount[t] - allocation[t]
-            give = min(share, room)
-            allocation[t] += give
+        for ticker in list(open_tickers):
+            share = remaining * (weight[ticker] / open_weight)
+            room = headroom[ticker] - allocation[ticker]
+
+            sector = sectors.get(ticker)
+            if sector:
+                current = sector_value.get(sector, 0.0)
+                base = invested + sum(allocation.values())
+                # (current + x) / (base + x) <= cap
+                cap = policy.max_sector_pct
+                sector_room = (
+                    max(0.0, (cap * base - current) / (1 - cap)) if cap < 1 else float("inf")
+                )
+                room = min(room, sector_room)
+
+            give = max(0.0, min(share, room))
+            allocation[ticker] += give
+            if sector and give > 0:
+                sector_value[sector] = sector_value.get(sector, 0.0) + give
             distributed += give
-            if allocation[t] >= max_amount[t] - 1e-9:
-                newly_capped.append(t)
-        remaining_cash -= distributed
-        for t in newly_capped:
-            open_tickers.discard(t)
+            if allocation[ticker] >= headroom[ticker] - 1e-9 or room <= 1e-9:
+                newly_capped.append(ticker)
+        remaining -= distributed
+        for ticker in newly_capped:
+            open_tickers.discard(ticker)
         if distributed <= 1e-9:
             break
 
-    return allocation
-
-
-def _check_age_horizon_volatility(
-    ticker: str,
-    info: Optional[Dict[str, Any]],
-    client_profile: Dict[str, Any],
-) -> Optional[str]:
-    """Rule 3: near-retirement / short-horizon clients shouldn't get
-    high-beta names.
-
-    Beta is commonly missing from yfinance for many tickers (unlike market
-    cap/exchange, which are near-universal) -- so unlike Rule 1, a missing
-    beta here just skips this specific check for this candidate rather than
-    being treated as its own violation.
-    """
-    age = client_profile.get("age", 0)
-    horizon = client_profile.get("time_horizon_years", 99)
-
-    if age < AGE_THRESHOLD and horizon > HORIZON_THRESHOLD_YEARS:
-        return None  # rule doesn't apply to this client
-
-    if info is None:
-        return None  # can't verify beta at all; don't block solely for missing data here
-
-    beta = info.get("beta")
-    if beta is None:
-        return None  # beta commonly unavailable on yfinance; skip rather than reject
-
-    if beta > MAX_BETA_NEAR_RETIREMENT:
-        return (
-            f"{ticker}: rejected -- beta {beta:.2f} exceeds the {MAX_BETA_NEAR_RETIREMENT} max "
-            f"for a client who is age {age} and/or has a {horizon}-year time horizon "
-            f"(near-retirement/short-horizon volatility guardrail)."
+    if remaining > policy.min_position_notional:
+        notes.append(
+            f"${remaining:,.0f} of investable cash was left undeployed because every "
+            f"approved candidate reached its position or sector limit. Deploying it would "
+            f"have breached a policy limit, so the run invests less rather than more."
         )
-    return None
+    return allocation, notes
 
 
 def suitability_node(state: AgentState) -> dict:
-    """LangGraph node: evaluate `state['candidate_stocks']` against the
-    client's profile via three deterministic rules and return a
-    `SuitabilityResult` plus this node's own audit_trail entry.
+    """Evaluate candidates against the client's policy and size the survivors."""
+    result: Optional[SuitabilityResult] = None
 
-    Returns ONLY {"suitability_result": ..., "audit_trail": [record]} --
-    never the accumulated audit_trail list, since `AgentState.audit_trail`
-    is `Annotated[..., operator.add]` and LangGraph concatenates it.
-    """
-    started_at = datetime.now(timezone.utc).isoformat()
-    logger.info(">>> [Suitability/Compliance Guardrail] Evaluating candidates against client profile...")
+    with node_run(NODE_NAME, state) as ctx:
+        candidates: List[Candidate] = list(state.get("candidate_stocks") or [])
+        profile = state.get("client_profile") or {}
+        client_id = profile.get("client_id")
 
-    candidates: List[Candidate] = state.get("candidate_stocks") or []
-    client_profile = state["client_profile"]
-    # portfolio_diagnostics is part of this node's documented input surface,
-    # but none of the three deterministic rules below need to read it
-    # directly -- risk tolerance/age/horizon/holdings on the client profile
-    # fully drive the checks. Referenced here (read-only) for future rules
-    # that may want to cross-check against diagnosed concentration flaws.
-    _diagnostics = state.get("portfolio_diagnostics")
+        db = SessionLocal()
+        try:
+            client = (
+                db.query(ClientProfileModel).filter(ClientProfileModel.id == client_id).first()
+            )
+            if client is None:
+                raise ValueError(f"No client profile with id {client_id}")
 
-    violations: List[str] = []
-    quality_passed: List[Candidate] = []
+            policy = resolve_policy(db, client)
+            view = load_portfolio(db, client)
+            ctx.policy_version = policy.version
+            ctx.input_snapshot = {
+                "candidates": [c.get("ticker") for c in candidates],
+                "policy_version": policy.version,
+                "investable_cash": round(view.cash, 2),
+            }
 
-    try:
-        for candidate in candidates:
-            ticker = candidate["ticker"]
-            info = _fetch_info(ticker)
+            violations: List[str] = []
+            passed: List[Candidate] = []
+            checks_applied = [
+                "security_quality", "policy_exclusions", "risk_fit",
+                "position_cap", "sector_cap", "minimum_size",
+            ]
 
-            reason = _check_security_quality(ticker, info)
-            if reason is None:
-                reason = _check_age_horizon_volatility(ticker, info, client_profile)
-
-            if reason is not None:
-                logger.info("    [Suitability] REJECTED %s: %s", ticker, reason)
-                violations.append(reason)
-            else:
-                quality_passed.append(candidate)
-
-        base_value = portfolio_base_value(client_profile)
-        allocations = _compute_allocations(quality_passed, client_profile)
-
-        adjusted_recommendations: List[Candidate] = []
-        for candidate in quality_passed:
-            ticker = candidate["ticker"]
-            amount = allocations.get(ticker, 0.0)
-            if amount < MIN_ALLOCATION_DOLLARS:
-                logger.info("    [Suitability] REJECTED %s: no available allocation room", ticker)
-                violations.append(
-                    f"{ticker}: rejected -- no meaningful room to add (${amount:,.0f} available) "
-                    f"after risk-tier position caps and existing holdings were applied."
+            for candidate in candidates:
+                reason = (
+                    _check_policy_exclusions(candidate, policy)
+                    or _check_security_quality(candidate, policy)
+                    or _check_risk_fit(candidate, policy, profile)
                 )
-                continue
-            logger.info("    [Suitability] APPROVED %s: allocating $%s", ticker, f"{amount:,.0f}")
-            adjusted_recommendations.append(
-                {
-                    **candidate,
-                    "allocation_amount": round(amount, 2),
-                    "allocation_pct": round(amount / base_value, 4) if base_value > 0 else 0.0,
-                }
+                if reason is not None:
+                    logger.info("[Suitability] %s", reason)
+                    violations.append(reason)
+                else:
+                    passed.append(candidate)
+
+            allocations, notes = _compute_allocations(passed, view, policy)
+            violations.extend(notes)
+
+            approved_recommendations: List[Candidate] = []
+            total = view.total_value
+            for candidate in passed:
+                ticker = candidate["ticker"]
+                amount = allocations.get(ticker, 0.0)
+                if amount < policy.min_position_notional:
+                    violations.append(
+                        _reject(
+                            ticker, "min_size",
+                            f"only ${amount:,.0f} could be allocated after position and sector "
+                            f"limits, below the ${policy.min_position_notional:,.0f} minimum "
+                            f"position size.",
+                        )
+                    )
+                    continue
+                approved_recommendations.append(
+                    {
+                        **candidate,
+                        "allocation_amount": round(amount, 2),
+                        "allocation_pct": round(amount / total, 4) if total > 0 else 0.0,
+                    }
+                )
+                logger.info(
+                    "[Suitability] approved %s: $%s (%.1f%% of portfolio)",
+                    ticker, f"{amount:,.0f}", (amount / total * 100) if total else 0,
+                )
+
+            result = SuitabilityResult(
+                approved=bool(approved_recommendations),
+                violations=violations,
+                adjusted_recommendations=approved_recommendations,
+                checks_applied=checks_applied,
             )
 
-        approved = len(adjusted_recommendations) > 0
+            allocated = sum(c["allocation_amount"] for c in approved_recommendations)
+            ctx.output_snapshot = {
+                "approved": len(approved_recommendations),
+                "rejected": len(candidates) - len(approved_recommendations),
+                "total_allocated": round(allocated, 2),
+            }
+            ctx.summary = (
+                f"Evaluated {len(candidates)} candidate(s): {len(approved_recommendations)} "
+                f"approved for ${allocated:,.0f}, {len(violations)} violation(s) recorded."
+            )
+            logger.info("[Suitability] %s", ctx.summary)
+        finally:
+            db.close()
 
-        suitability_result: SuitabilityResult = {
-            "approved": approved,
-            "violations": violations,
-            "adjusted_recommendations": adjusted_recommendations,
-        }
-
-        summary = (
-            f"Evaluated {len(candidates)} candidate(s): {len(adjusted_recommendations)} approved "
-            f"with a total of ${sum(c['allocation_amount'] for c in adjusted_recommendations):,.0f} "
-            f"allocated, {len(violations)} violation(s) recorded."
+    if result is None:
+        # The node raised. Fail closed: recommending nothing is the safe
+        # direction for a control that could not complete.
+        result = SuitabilityResult(
+            approved=False,
+            violations=[
+                "The suitability guardrail could not complete, so no recommendation is "
+                "approved. This is a deliberate fail-closed: an unevaluated recommendation "
+                "is not an approved one."
+            ],
+            adjusted_recommendations=[],
+            checks_applied=[],
         )
-        logger.info("    [Suitability] %s", summary)
 
-        record: AgentRunRecord = {
-            "node_name": "suitability",
-            "started_at": started_at,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "status": "success",
-            "summary": summary,
-            "error_detail": None,
-        }
-
-        return {"suitability_result": suitability_result, "audit_trail": [record]}
-
-    except Exception as e:
-        # Fail closed: an unexpected error means we can't vouch for any
-        # candidate this run, so nothing is approved.
-        record: AgentRunRecord = {
-            "node_name": "suitability",
-            "started_at": started_at,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "status": "error",
-            "summary": "Suitability node failed with an unexpected error.",
-            "error_detail": f"{e}\n{traceback.format_exc()}",
-        }
-        suitability_result: SuitabilityResult = {
-            "approved": False,
-            "violations": [f"Suitability node error: {e}"],
-            "adjusted_recommendations": [],
-        }
-        return {"suitability_result": suitability_result, "audit_trail": [record]}
-
-
-if __name__ == "__main__":
-    import json
-
-    from logging_setup import configure_logging
-
-    configure_logging()
-
-    # Realistic sample AgentState for a Conservative client.
-    # Portfolio base = CASH 5,000 + AAPL 7,500 = $12,500 -- the managed
-    # portfolio value, which is what position caps are measured against (see
-    # agents/limits.py). Conservative cap = 15% = $1,875 per single position.
-    #
-    # Two candidates, $5,000 available CASH to deploy:
-    #   - AAPL: real large-cap, major-exchange ticker that clears the
-    #     security-quality screen (Rule 1) and the beta check (Rule 3, since
-    #     this client is 45 / 20yr horizon so the rule doesn't even apply) --
-    #     but the client ALREADY holds $7,500 of AAPL, exactly at the 15%
-    #     Conservative cap, so there is zero room left to add more. Expect
-    #     it to clear the quality/beta checks but get rejected at the sizing
-    #     step for having no available allocation room.
-    #   - JNJ: real large-cap, major-exchange ticker, no existing holding --
-    #     should receive the full $5,000 of available cash (nothing left to
-    #     compete for it once AAPL is capped out) and land in
-    #     adjusted_recommendations with that allocation.
-    sample_state: AgentState = {
-        "run_id": "test-run-001",
-        "client_profile": {
-            "client_id": 1,
-            "age": 45,
-            "risk_tolerance": "Conservative",
-            "time_horizon_years": 20,
-            "goals": ["retirement"],
-            "holdings": {
-                "CASH": 5000.0,
-                "AAPL": 7500.0,
-            },
-            "net_worth": 50000.0,
-        },
-        "portfolio_diagnostics": {
-            "concentration": {"AAPL": 0.13},
-            "sector_exposure": {"Technology": 0.13},
-            "sharpe_ratio": 0.8,
-            "annual_return": 0.09,
-            "annual_volatility": 0.18,
-            "diversification_score": 55.0,
-            "flaws": ["13% concentrated in AAPL"],
-            "market_data_tickers": ["AAPL"],
-        },
-        "market_regime": None,
-        "candidate_stocks": [
-            {
-                "ticker": "AAPL",
-                "valuation_metrics": {"pe_ratio": 30.0},
-                "addresses_flaw": "13% concentrated in AAPL",  # deliberately bad pick, exercises the guardrail
-                "regime_fit_rationale": "test candidate for position-limit violation",
-                "confidence": 0.6,
-            },
-            {
-                "ticker": "JNJ",
-                "valuation_metrics": {"pe_ratio": 15.0},
-                "addresses_flaw": "13% concentrated in AAPL",
-                "regime_fit_rationale": "defensive healthcare diversifier",
-                "confidence": 0.8,
-            },
-        ],
-        "suitability_result": None,
-        "tax_assessment": None,
-        "final_report": None,
-        "audit_trail": [],
-        "requires_human_approval": False,
-        "human_approved": None,
-        "research_attempts": 0,
-        "needs_research_retry": False,
-    }
-
-    result = suitability_node(sample_state)
-
-    print("\n=== suitability_node output ===")
-    print(json.dumps(result, indent=2, default=str))
-
-    sr = result["suitability_result"]
-    print("\n=== Assertions ===")
-    approved_tickers = [c["ticker"] for c in sr["adjusted_recommendations"]]
-    print("approved tickers:", approved_tickers)
-    print("violations:", sr["violations"])
-    assert "JNJ" in approved_tickers, "expected JNJ to be approved"
-    assert any("AAPL" in v and "cap" in v for v in sr["violations"]), "expected AAPL position-limit violation"
-    jnj = next(c for c in sr["adjusted_recommendations"] if c["ticker"] == "JNJ")
-    # Portfolio base $12,500 x 15% Conservative cap = $1,875 max per position,
-    # so JNJ is capped there rather than taking all $5,000 of available cash.
-    assert jnj["allocation_amount"] == 1875.0, (
-        f"expected JNJ to be capped at $1,875 (15% of the $12,500 portfolio), "
-        f"got {jnj['allocation_amount']}"
-    )
-    print("\nAll assertions passed: clean candidate sized and capped, capped-out position rejected.")
+    return finish(ctx, {"suitability_result": result})
