@@ -29,15 +29,8 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
-import pandas as pd
 from pypfopt import expected_returns, risk_models
 
-from agents.limits import (
-    DEFAULT_POSITION_CAP as DEFAULT_CONCENTRATION_LIMIT,
-)
-from agents.limits import (
-    RISK_TIER_POSITION_CAP as CONCENTRATION_LIMITS,
-)
 from agents.limits import position_cap_fraction
 from config import settings
 from logging_setup import get_logger

@@ -53,8 +53,6 @@ logger = get_logger(__name__)
 # See that module for why the denominator had to be unified, not just the
 # percentages.
 from agents.limits import (  # noqa: E402 -- after the sys.path bootstrap above
-    DEFAULT_POSITION_CAP,
-    RISK_TIER_POSITION_CAP,
     portfolio_base_value,
     position_cap_fraction,
 )

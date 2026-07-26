@@ -38,7 +38,6 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from db import Account, ClientProfile, Execution, Position, TaxLot, to_float, utcnow

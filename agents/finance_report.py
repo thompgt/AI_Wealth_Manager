@@ -20,7 +20,7 @@ non-empty final_report.
 """
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from langchain_core.prompts import ChatPromptTemplate
 

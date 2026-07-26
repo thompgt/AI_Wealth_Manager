@@ -685,6 +685,11 @@ class Order(Base):
     # duplicated request returns the original order instead of doubling the
     # position.
     idempotency_key = Column(String(80), nullable=True)
+    # Cash set aside for an open buy, released when it fills or cancels.
+    # Without a reservation, every order in a batch validates against the same
+    # untouched balance and the batch as a whole overdraws the account -- the
+    # portfolio then appears to gain the overdrawn amount out of nowhere.
+    reserved_cash = Column(Money, nullable=False, default=0)
 
     created_at = Column(DateTime, nullable=False, default=utcnow)
     submitted_at = Column(DateTime, nullable=True)
