@@ -7,6 +7,15 @@ recommendations the system would otherwise make.
 
 The interesting behaviour is not that it recommends things. It's where it refuses to.
 
+## Tech Stack
+
+![LangGraph](https://img.shields.io/badge/LangGraph-1C3C3C?style=for-the-badge&logo=langgraph&logoColor=white)
+![LangChain](https://img.shields.io/badge/LangChain-1C3C3C?style=for-the-badge&logo=langchain&logoColor=white)
+![Google Gemini](https://img.shields.io/badge/Google%20Gemini-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white)
+![Portfolio Rebalancing](https://img.shields.io/badge/Portfolio%20Rebalancing-0B7261?style=for-the-badge)
+![Wash-Sale Guardrails](https://img.shields.io/badge/Wash--Sale%20Guardrails-8A2B2B?style=for-the-badge)
+![Tax-Lot Accounting](https://img.shields.io/badge/Tax--Lot%20Accounting-1F4E79?style=for-the-badge)
+
 <p align="center">
   <img src="docs/screenshots/03-recommendations.png" alt="Recommended deployment, with two candidates withheld by the wash-sale guardrail" width="900">
 </p>
