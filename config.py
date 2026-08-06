@@ -133,6 +133,18 @@ class Settings(BaseSettings):
     RATE_LIMIT_PER_MINUTE: int = 120
     RUN_RATE_LIMIT_PER_HOUR: int = 30
 
+    # --- Observability -------------------------------------------------------
+    # Serve GET /metrics without credentials. Off by default, and deliberately
+    # so: the exposition carries per-route request counts, per-node LLM spend
+    # and job queue depth, which together describe how much business is
+    # flowing through the system and when it is struggling. That is not
+    # something to hand to an unauthenticated caller on a public interface.
+    #
+    # Turn it on only for a local Prometheus, which has no way to present an
+    # API key or a bearer token without a proxy in front of it. Everything
+    # else stays gated; this flag affects exactly one route.
+    METRICS_ALLOW_ANONYMOUS: bool = False
+
     # --- Job queue -----------------------------------------------------------
     # A graph run takes minutes. It executes on a background worker pool and
     # the API returns a job id immediately.
