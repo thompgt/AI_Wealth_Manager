@@ -112,6 +112,17 @@ llm_latency = Histogram(
     buckets=(0.5, 1, 2, 5, 10, 20, 40, 80),
     registry=REGISTRY,
 )
+llm_budget_headroom = Gauge(
+    "llm_budget_headroom_usd",
+    "Unspent LLM budget on the run that most recently spent, in USD. "
+    "`llm_cost_usd_total` is cumulative across every run and so cannot say "
+    "whether any single run is near its LLM_RUN_BUDGET_USD cap -- and hitting "
+    "that cap drops the remaining agents to their deterministic paths, which "
+    "is a 200 response with worse output. This is the leading indicator for "
+    "the degradation that `agent_degraded_total` reports after the fact.",
+    registry=REGISTRY,
+)
+
 
 # --- Market data -------------------------------------------------------------
 

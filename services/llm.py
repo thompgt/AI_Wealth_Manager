@@ -42,7 +42,14 @@ from typing import Any, Callable, Dict, Optional, TypeVar
 
 from config import settings
 from logging_setup import get_logger
-from metrics import llm_calls, llm_cost, llm_latency, llm_tokens, timed
+from metrics import (
+    llm_budget_headroom,
+    llm_calls,
+    llm_cost,
+    llm_latency,
+    llm_tokens,
+    timed,
+)
 
 logger = get_logger(__name__)
 
@@ -208,6 +215,11 @@ def run_budget(budget: Optional["RunBudget"] = None):
     """Bind a spend ceiling for everything invoked inside this block."""
     previous = getattr(_budget_local, "budget", None)
     _budget_local.budget = budget if budget is not None else RunBudget()
+    # A gauge, not a per-run series: a run id label would add one time series
+    # per run and never retire it. With more than one worker this reads as
+    # "headroom on whichever run touched it last", which is enough to see
+    # runs crowding the cap without unbounded cardinality.
+    llm_budget_headroom.set(_budget_local.budget.remaining())
     try:
         yield _budget_local.budget
     finally:
@@ -339,6 +351,10 @@ def invoke_tracked(
     usage = extract_usage(response)
     if budget is not None:
         budget.record(usage)
+        # Published after every call rather than only at the end of a run: the
+        # point is to watch headroom fall toward zero while there is still
+        # time to notice, not to learn afterwards that it ran out.
+        llm_budget_headroom.set(budget.remaining())
 
     llm_calls.labels(node, "success").inc()
     if usage.prompt_tokens:
