@@ -13,6 +13,13 @@
 # The host ports are deliberately off the defaults (9090, 3000/3001): this machine
 # runs several observability stacks side by side and the defaults collide.
 
+# Set explicitly. Compose otherwise derives the project name from the containing
+# directory, which is `monitoring` — the same name several other projects on this
+# machine use for their own stack. Sharing a project name means sharing volumes,
+# and `docker compose up` in one of them adopts and recreates the other's
+# containers.
+name: wealth-monitoring
+
 services:
   prometheus:
     image: prom/prometheus:v3.1.0
