@@ -1,0 +1,64 @@
+# Local monitoring stack for the AI Wealth Manager API: Prometheus scrapes the API's
+# /metrics endpoint, Grafana renders it. Both are provisioned from files in this
+# directory, so `docker compose up -d` gives a working dashboard with no clicking
+# through setup wizards.
+#
+#   uvicorn server:app --port 8001     # in the repo root, with METRICS_ALLOW_ANONYMOUS=true
+#   cd monitoring && docker compose up -d
+#   Grafana:    http://localhost:3004  (admin / admin)
+#   Prometheus: http://localhost:9093
+#
+# The API itself runs on the host, not in Compose — this stack only observes it.
+#
+# The host ports are deliberately off the defaults (9090, 3000/3001): this machine
+# runs several observability stacks side by side and the defaults collide.
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: wealth-prometheus
+    restart: unless-stopped
+    ports:
+      - '9093:9090'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      # Needed for the runtime-reload used when changing the scrape target's port.
+      - '--web.enable-lifecycle'
+    extra_hosts:
+      # Lets the container reach an API running on the host. Docker Desktop provides
+      # host.docker.internal already; this keeps the same config working on Linux.
+      - 'host.docker.internal:host-gateway'
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: wealth-grafana
+    restart: unless-stopped
+    ports:
+      # 3004 rather than Grafana's default 3000, which collides with too many dev
+      # servers — and with the other local Grafanas on 3001-3003.
+      - '3004:3000'
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # This is a local observability sandbox, not an internet-facing Grafana.
+      # Anonymous viewers keep screenshots and demos frictionless; do not carry
+      # this to a real deployment.
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+      GF_FEATURE_TOGGLES_ENABLE: ''
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  prometheus-data:
+  grafana-data:

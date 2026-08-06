@@ -1,0 +1,35 @@
+# Scrape config for the AI Wealth Manager API.
+#
+# The API runs on the host (`uvicorn server:app --port 8001`), not inside this
+# Compose project, so the target is host.docker.internal rather than a service name.
+# 8001 rather than uvicorn's default 8000, which is taken on this machine.
+#
+# If you start the API on a different port, change the target below and reload
+# without restarting the container:
+#   curl -X POST http://localhost:9093/-/reload
+#
+# The API must be started with METRICS_ALLOW_ANONYMOUS=true, or every scrape gets
+# a 401 and the target reads DOWN with "server returned HTTP status 401".
+
+global:
+  # 5s rather than the usual 15s. A graph run is a burst of a few dozen LLM and
+  # market-data calls over a couple of minutes; at 15s the per-node panels are
+  # three or four samples wide and read as noise.
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: wealth-local
+
+scrape_configs:
+  - job_name: wealth-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:8001']
+        labels:
+          component: api
+
+  # Prometheus watching itself — useful for telling "the API is down" apart from
+  # "the scraper is down" when a panel goes empty.
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
