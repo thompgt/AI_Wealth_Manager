@@ -13,9 +13,13 @@ graph inline, holding a request thread for minutes while the client's own
 timeout raced it.
 """
 
+import threading
+import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from decimal import Decimal
+from itertools import islice
 from typing import Dict, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -143,7 +147,6 @@ async def observability_middleware(request: Request, call_next):
     labelling by `/clients/8123` produces one time series per client, which is
     how a metrics backend is taken down by its own instrumentation.
     """
-    import time
     import uuid
 
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:8]
@@ -169,20 +172,55 @@ async def observability_middleware(request: Request, call_next):
 # replica and honest about it: a multi-replica deployment needs a shared store,
 # and the alternative of pretending otherwise is a limit that silently
 # multiplies by the replica count.
-_rate_state: Dict[str, List[float]] = {}
+#
+# Bounded, because one of the keys is `login:{client_ip}` and an unauthenticated
+# caller chooses that key. An unbounded dict makes the login endpoint a slow
+# memory-exhaustion vector: a few million requests from spoofed or rotating
+# source addresses, none of them ever needing to authenticate, and nothing ever
+# evicted. An LRU discards the least recently seen key instead, and since the
+# window is a minute, a key old enough to be evicted under pressure has almost
+# certainly expired anyway.
+#
+# Guarded by a lock, because the read-modify-write below races: uvicorn runs
+# sync endpoint functions in a threadpool, so two threads could both read a
+# bucket one under the limit and both append, admitting more requests than the
+# limit allows.
+_RATE_STATE_MAX_KEYS = 20_000
+_rate_state: "OrderedDict[str, List[float]]" = OrderedDict()
+_rate_lock = threading.Lock()
 
 
 def _rate_limit(key: str, limit: int, window_seconds: int) -> bool:
-    import time
-
     now = time.time()
-    bucket = _rate_state.setdefault(key, [])
     cutoff = now - window_seconds
-    bucket[:] = [t for t in bucket if t > cutoff]
-    if len(bucket) >= limit:
-        return False
-    bucket.append(now)
-    return True
+
+    with _rate_lock:
+        bucket = _rate_state.get(key)
+        if bucket is None:
+            bucket = []
+            _rate_state[key] = bucket
+        else:
+            bucket[:] = [t for t in bucket if t > cutoff]
+        _rate_state.move_to_end(key)
+
+        if len(bucket) >= limit:
+            return False
+        bucket.append(now)
+
+        # Sweep a bounded number of expired buckets per call, so a burst of
+        # one-off keys is reclaimed without ever walking the whole dict on a
+        # request path.
+        for stale_key in list(islice(_rate_state.keys(), 32)):
+            if stale_key == key:
+                continue
+            stale = _rate_state[stale_key]
+            if not stale or stale[-1] <= cutoff:
+                del _rate_state[stale_key]
+
+        while len(_rate_state) > _RATE_STATE_MAX_KEYS:
+            _rate_state.popitem(last=False)
+
+        return True
 
 
 def rate_limited(principal: Principal = Depends(get_principal)) -> Principal:
