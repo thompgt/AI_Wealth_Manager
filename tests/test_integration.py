@@ -167,9 +167,19 @@ def test_full_graph_run_reaches_approval_gate_and_produces_a_report(
 def test_wash_sale_seed_scenario_is_still_caught(patched_external_calls, seeded_client):
     """
     The seeded client sold five names at a loss in the last 30 days (see
-    `demo_data.RECENTLY_HARVESTED`). If stock_research happens to propose any
-    of them this run, tax_awareness must flag it -- unprompted, from the real
-    lot records, with no forcing.
+    `demo_data.RECENTLY_HARVESTED`). On an unforced run this asserts the flags
+    in both directions:
+
+    * any harvested name research happens to propose *is* flagged, unprompted,
+      from the real lot records; and
+    * nothing else is. The screen usually fixes this portfolio's concentration
+      with international funds and proposes none of the harvested names, in
+      which case there must be no flags at all -- a run that flagged them
+      anyway would be the old bug, where the check fired on the client's
+      sale history rather than on what was actually being bought.
+
+    The forced-candidate test below is what proves enforcement; this one proves
+    the flag tracks the candidates.
     """
     run = orchestrator.run_client_graph(seeded_client)
     result = run["result"]
@@ -182,11 +192,15 @@ def test_wash_sale_seed_scenario_is_still_caught(patched_external_calls, seeded_
     assert tax_assessment.get("verification_failed") is False
 
     harvested = set(demo_data.RECENTLY_HARVESTED)
-    proposed_harvested = {
-        str(c["ticker"]).upper() for c in candidates if str(c["ticker"]).upper() in harvested
-    }
-    for ticker in proposed_harvested:
-        assert ticker in tax_assessment.get("wash_sale_flags", [])
+    proposed = {str(c["ticker"]).upper() for c in candidates}
+    flags = set(tax_assessment.get("wash_sale_flags") or [])
+
+    assert proposed & harvested == flags, (
+        f"wash-sale flags {sorted(flags)} do not match the harvested names actually "
+        f"proposed {sorted(proposed & harvested)}"
+    )
+    assert flags <= proposed, "a ticker was flagged that this run never proposed buying"
+    assert set(result.get("tax_blocked_recommendations") or []) <= flags
 
 
 def test_a_wash_sale_flag_removes_the_ticker_from_the_final_recommendations(

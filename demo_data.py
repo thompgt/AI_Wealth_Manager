@@ -324,6 +324,12 @@ def seed_demo_client(price_lookup: Optional[PriceLookup] = None) -> int:
             logger.info("Demo client already present (id=%s)", existing.id)
             return existing.id
 
+        # Priced before anything is written. The default lookup goes to the
+        # network, and holding an open write transaction across a slow call
+        # locks the database against the quote cache's own writes -- and if the
+        # call fails, nothing has been half-created.
+        prices = dict(price_lookup(list(TARGET_WEIGHTS)))
+
         org, advisor = _tenancy(db)
         # The research agents can only recommend what is in the securities
         # master, and the portfolio's sector exposure is read from it too, so
@@ -381,7 +387,7 @@ def seed_demo_client(price_lookup: Optional[PriceLookup] = None) -> int:
         db.add_all([taxable, retirement])
         db.flush()
 
-        seeded_symbols = _seed_equity_sleeve(db, taxable, price_lookup)
+        seeded_symbols = _seed_equity_sleeve(db, taxable, prices)
         realized_loss = _seed_harvested_losses(db, taxable)
 
         for account in (taxable, retirement):
