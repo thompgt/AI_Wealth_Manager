@@ -269,6 +269,7 @@ approval round trip. Agents never call the network directly; everything goes thr
 | `agents/limits.py` | Shared risk-tier limits used by diagnostics and suitability, so both score against the same numbers. |
 | `services/market_data.py` | yfinance access behind a DB-backed price cache and a process-level ticker-info TTL cache. |
 | `services/llm.py` | Single Gemini client factory plus `invoke_with_retry`; classifies transient vs permanent failures so agents drop to fallback immediately when retrying cannot help. |
+| `services/performance.py` | Snapshots, TWR and IRR, risk statistics annualised by the observed cadence, Brinson attribution and the recommendation scorecard. See [Performance measurement](#performance-measurement). |
 | `services/news_service.py` | Best-effort DuckDuckGo news for regime context, plus deterministic lexicon sentiment. Degrades explicitly rather than returning a silent `[]` — supplementary, never ground truth. |
 | `services/untrusted.py` | Fences content the firm did not write — search snippets, client notes — inside a sanitised `<untrusted_data>` element with a standing data-not-instructions clause. See [Untrusted content in prompts](#untrusted-content-in-prompts). |
 
@@ -358,6 +359,54 @@ All endpoints except `/health` require an `X-API-Key` header.
 | `GET` | `/api/v1/clients/{id}/reports` · `/api/v1/reports/{id}` | Reports |
 
 Interactive docs at `http://localhost:8000/docs`.
+
+## Performance measurement
+
+The component that can make the system look bad, which is why it exists. Without it the
+service produces confident recommendations forever with no feedback signal.
+
+**Snapshots.** `services/run_service.py` writes a `portfolio_snapshots` row at the end of every
+completed run — market value, cash, and the day's external flows read from `cash_transactions`
+rather than inferred, because a $50k jump is either a good day or a wire transfer and only the
+transaction log knows which. Writes are idempotent per (client, date), so a retried job cannot
+double-count a day. The cadence is therefore "days a run happened", not daily, which the
+statistics account for rather than assume away.
+
+**Two return numbers, deliberately.** Time-weighted return neutralises deposits and withdrawals
+and measures the *strategy*. Money-weighted return (IRR, solved by bisection over a bounded
+bracket) measures the *client's experience*, which depends on when they added money. Reporting
+only the first is how a portfolio that returned 12% gets described to a client who made 3%.
+
+**Risk statistics** are annualised by the cadence actually observed — derived from the median
+gap between snapshots, capped at 252 — not by assuming a daily series. Max drawdown is measured
+on a growth index compounded from flow-adjusted returns, so a client's 30% withdrawal is not
+reported as a 30% drawdown. Below 60 observations nothing is annualised at all; the result says
+why instead.
+
+**Reconstructed history is excluded by default.** `backfill_snapshots` applies today's share
+counts to past prices, which describes what the current portfolio *would* have done. Those rows
+carry `is_reconstructed`; `GET /performance` filters them out unless asked, and when included
+the response sets `includes_reconstructed` and states the survivorship bias in `notes`.
+
+**Attribution** is Brinson-Hood-Beebower, splitting excess return into an allocation effect
+(weighting an asset class differently from the benchmark) and a selection effect (holding better
+things within one). Interaction is folded into selection, the common two-factor presentation.
+
+**The scorecard** scores each recommendation against the benchmark at 30, 90 and 365 days. Both
+legs are read at the recommendation date and at that date plus the horizon, so a 30-day call is
+a 30-day number however late the evaluation job runs; if either close is missing the outcome is
+voided rather than guessed. Hit rate is always reported with its denominator, and flagged
+`reliable` only above 30 scored outcomes — "62% of our picks beat the benchmark" means something
+over 200 recommendations and nothing over eight.
+
+| Method | Path | |
+|---|---|---|
+| `GET` | `/api/v1/clients/{id}/performance` | Returns, risk, benchmark comparison and the scorecard. `?days=` windows it; `?include_reconstructed=true` opts into backfilled history |
+| `POST` | `/api/v1/maintenance/evaluate-outcomes` | Scores recommendations whose horizon has elapsed. Intended for a cron; admin-only |
+
+Every function here refuses to compute rather than extrapolate: fewer than two snapshots is not
+a 0% return, an unpriced benchmark is not a flat benchmark, and thirty days of history does not
+produce an annualised figure. `None` with a stated reason is the design.
 
 ## Untrusted content in prompts
 
