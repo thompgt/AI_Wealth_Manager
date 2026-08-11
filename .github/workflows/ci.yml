@@ -1,0 +1,79 @@
+name: CI
+
+# The suite already ran offline against a temp database -- tests/conftest.py
+# points the engine at a throwaway SQLite file and stubs every network and LLM
+# call -- so there was nothing standing between "these tests exist" and "these
+# tests run on every push" except this file.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A second push to the same branch makes the first run's answer irrelevant.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # No secrets are needed and none are referenced: a run that quietly depended
+  # on a key would pass for maintainers and fail for every contributor.
+  # Agents drop to their deterministic fallbacks when the key is a placeholder,
+  # which is a path worth exercising anyway.
+  ENVIRONMENT: development
+  GEMINI_API_KEY: DUMMY_API_KEY
+  LLM_MAX_ATTEMPTS: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Single version on purpose. The dependency set is pinned to exact
+          # versions precisely so every install resolves identically, and this
+          # is the interpreter the pins were verified against. A matrix here
+          # would be testing whether pandas and yfinance publish wheels for
+          # other versions, which is not this repo's risk.
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Migrations apply from empty
+        # Catches the failure create_all cannot: a model changed and no
+        # migration was written for it. Runs against SQLite because the point
+        # is whether the migration chain is coherent, not which engine runs it.
+        env:
+          NEON_DATABASE_URL: sqlite:///./ci-migrations.db
+        run: alembic upgrade head
+
+      - name: Migrations match the models
+        # `alembic check` autogenerates against the just-migrated database and
+        # fails if it finds anything to emit. Without this, a column added to
+        # db.py works locally forever -- SQLite is created from the models in
+        # tests -- and only fails on a real deployment, which is the worst
+        # possible place to discover it.
+        env:
+          NEON_DATABASE_URL: sqlite:///./ci-migrations.db
+        run: alembic check
+
+      - name: Migrations reverse
+        # A downgrade path nobody exercises is a downgrade path that does not
+        # work, which matters exactly once, under pressure, during a rollback.
+        env:
+          NEON_DATABASE_URL: sqlite:///./ci-migrations.db
+        run: alembic downgrade base
+
+      - name: Tests
+        run: pytest

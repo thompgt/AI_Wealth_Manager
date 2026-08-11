@@ -1,5 +1,7 @@
 # AI Wealth Manager
 
+[![CI](https://github.com/thompgt/AI_Wealth_Manager/actions/workflows/ci.yml/badge.svg)](https://github.com/thompgt/AI_Wealth_Manager/actions/workflows/ci.yml)
+
 A multi-agent portfolio analysis system. Six specialist agents run as a LangGraph workflow
 over a client's portfolio and live market data, and produce a sized, explained set of
 recommendations — with hard compliance and tax guardrails that can and do **withhold**
@@ -444,13 +446,24 @@ regime call was, what was proposed, and what was withheld.
 ## Tests
 
 ```bash
-pytest              # 78 tests, no network or API key required
+pytest              # 231 tests, no network or API key required
+ruff check .        # lint
 ```
 
 The suite runs against a temporary database, never the local one, and stubs every network and
-LLM call. It covers each agent's pure logic, the guardrail gate's reconciliation and retry
-accumulation, the HTTP surface, and an end-to-end proof that a wash-sale-flagged ticker cannot
-reach the final recommendations.
+LLM call. It covers the return and risk arithmetic (TWR, IRR, drawdown, the annualisation
+cadence, horizon pricing), tax-lot selection under each method and the holding-period boundary,
+each agent's pure logic, the guardrail gate's reconciliation and retry accumulation, the
+untrusted-data fencing, the authenticated and tenant-scoped HTTP surface, and an end-to-end
+proof that a wash-sale-flagged ticker cannot reach the final recommendations.
+
+### CI
+
+`.github/workflows/ci.yml` runs on every push and pull request: `ruff check`, then the
+migrations applied to an empty SQLite database, then `alembic check` — which autogenerates
+against the migrated schema and fails if it finds anything to emit, so a column added to `db.py`
+without a migration cannot reach a deployment — then a full downgrade back to base, then
+`pytest`. No secrets are referenced, so the run works identically on a fork.
 
 ## Layout
 
