@@ -226,7 +226,8 @@ approval round trip. Agents never call the network directly; everything goes thr
    plain-language flaws. Market Regime computes trend signals from 12 macro tickers and 5 ratio
    pairs, pulls best-effort news, and asks the LLM to classify the regime grounded in those
    signals — falling back to `Volatile`/confidence 0.0 if the LLM is unavailable.
-4. **`stock_research`** screens the 34-name `CANDIDATE_UNIVERSE`, driven by the diagnosed
+4. **`stock_research`** screens the `securities` catalogue (a ~170-name multi-asset seed,
+   refreshable without a deploy), driven by the diagnosed
    flaws and the regime, skipping anything in `excluded_tickers`. Each candidate must name the
    flaw it addresses.
 5. **Superstep 2** runs `suitability` and `tax_awareness` in parallel. Neither sees the other.
@@ -262,7 +263,8 @@ approval round trip. Agents never call the network directly; everything goes thr
 | `app.py` | Solara dashboard. Holds no business logic — it is an HTTP client of `server.py`, including the approval round trip. |
 | `agents/diagnostics.py` | Valuation, concentration, sector exposure, and Sharpe/return/volatility computed directly from the price history, scored against the client's risk tier. |
 | `agents/market_regime.py` | Deterministic macro trend signals, then LLM classification grounded in them. Fail-safe to `Volatile`/0.0. |
-| `agents/stock_research.py` | Flaw-driven screen over `CANDIDATE_UNIVERSE`, relative-valuation filter, ranking, and consumption of retry feedback. |
+| `agents/stock_research.py` | Flaw-driven screen over the `securities` catalogue, relative-valuation filter, ranking, and consumption of retry feedback. Client notes reach the prompt only inside an `<untrusted_data>` fence. |
+| `services/universe.py` | The investable universe: a multi-asset seed catalogue in the `securities` table plus fundamentals refresh. Rows can be added, deactivated or restricted per firm without a deploy. |
 | `agents/suitability.py` | Security-quality, beta, and position-cap rules; then dollar sizing by confidence weight, water-filling around each cap. No LLM. |
 | `agents/tax_awareness.py` | 30-day wash-sale check against the transaction log; embedded gain/loss notes. No LLM. |
 | `agents/finance_report.py` | Six-section client report under grounding rules, with a deterministic template fallback. |
@@ -277,7 +279,7 @@ approval round trip. Agents never call the network directly; everything goes thr
 |---|---|---|
 | **Portfolio Diagnostics** | No | Values holdings at live prices; computes concentration, sector exposure, and Sharpe/return/volatility from the price history. Scores all of it against the client's own risk tier. |
 | **Market Regime** | Hybrid | Computes auditable trend signals from 12 macro tickers and 5 ratio pairs, then has an LLM classify the regime *grounded in those signals*. Fails to `Volatile`/confidence 0.0 — never an optimistic default. |
-| **Stock Research** | Yes | Screens a curated 34-name universe driven by the *diagnosed flaws*, filters on relative valuation, and ranks. Every candidate must name the flaw it addresses. |
+| **Stock Research** | Yes | Screens the multi-asset `securities` catalogue driven by the *diagnosed flaws*, filters on relative valuation, and ranks. Every candidate must name the flaw it addresses. |
 | **Suitability** | **No** | Security quality (≥ $2B cap, major exchange, verifiable data), a near-retirement beta ceiling, and risk-tier position caps. Then sizes survivors from available cash by confidence weight, water-filling around each cap. |
 | **Tax-Awareness** | **No** | 30-day wash-sale check against the transaction log; embedded gain/loss notes on current holdings. |
 | **Finance Report** | Yes | Synthesises everything into a six-section client report under strict grounding rules, with a deterministic template fallback. |
@@ -468,9 +470,10 @@ PLAN.md               The original build plan
 
 - **Advisory only.** Nothing here executes a trade. Reports are informational and carry an
   explicit disclaimer; a human should review before acting.
-- **The stock universe is a fixed 34-name list.** There is no paid screener API wired in, so
-  the research agent cannot discover names outside `CANDIDATE_UNIVERSE` in
-  `agents/stock_research.py`. This is a real constraint on recommendation breadth.
+- **The universe is a seeded catalogue, not a live screener.** There is no paid screener API
+  wired in, so the research agent can only recommend instruments present in the `securities`
+  table — around 170 names out of the box, extensible without a deploy, but still a curated
+  opportunity set rather than the whole market. A real constraint on recommendation breadth.
 - **The wash-sale check sees only this system's transaction log**, and only the
   30-days-*after* side of the rule. It cannot see the client's other brokerage accounts or a
   spouse's, which the actual IRS rule covers.
