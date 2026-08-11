@@ -112,6 +112,30 @@ def clear_news_cache() -> None:
         _cache.clear()
 
 
+# Words that invert or cancel the sentiment word following them. "Recession
+# fears ease" is a bullish headline that bare substring matching scores as
+# bearish, because it can see "recession" and not "ease". The regime scorer
+# shifts its label on this number, so the error is not cosmetic.
+_NEGATORS = {
+    "no", "not", "never", "without", "avoid", "avoids", "avoided",
+    "ease", "eases", "fade", "fades", "fading",
+    "recede", "recedes", "receding", "abate", "abates", "abating",
+    "dispel", "dispels", "dispelled", "unlikely", "denies", "denied",
+    "rules out", "less", "fewer", "off", "overblown", "unfounded",
+}
+# How many tokens after a matched phrase to search for a negator, and how many
+# before. "Recession fears ease" needs two tokens of look-ahead; "no recovery"
+# needs one of look-behind.
+_NEGATION_WINDOW = 3
+
+
+def _is_negated(tokens: List[str], start: int, length: int) -> bool:
+    """Whether a negator sits within the window around a matched phrase."""
+    before = tokens[max(0, start - _NEGATION_WINDOW):start]
+    after = tokens[start + length:start + length + _NEGATION_WINDOW]
+    return any(token in _NEGATORS for token in before + after)
+
+
 def score_sentiment(texts: List[str]) -> float:
     """Net sentiment in -1..1 across a set of headlines.
 
@@ -119,16 +143,33 @@ def score_sentiment(texts: List[str]) -> float:
     mildly positive headlines do not outweigh one that says "crash". Returns
     0.0 when nothing matched, which means "no signal", not "neutral" -- the
     caller should check `headline_count` to tell them apart.
+
+    A match with a negator within a few tokens flips sign rather than counting
+    at face value. This is a lexicon, not a parser, so it will not catch every
+    construction -- but "recession fears ease" scoring bearish was moving the
+    regime label in exactly the wrong direction.
     """
     positive = negative = 0
     for text in texts:
         lowered = re.sub(r"[^a-z0-9\s-]", " ", (text or "").lower())
-        for phrase, weight in _POSITIVE.items():
-            if phrase in lowered:
-                positive += weight
-        for phrase, weight in _NEGATIVE.items():
-            if phrase in lowered:
-                negative += weight
+        tokens = lowered.split()
+
+        for lexicon, sign in ((_POSITIVE, 1), (_NEGATIVE, -1)):
+            for phrase, weight in lexicon.items():
+                phrase_tokens = phrase.split()
+                span = len(phrase_tokens)
+                for index in range(len(tokens) - span + 1):
+                    if tokens[index:index + span] != phrase_tokens:
+                        continue
+                    effective = -sign if _is_negated(tokens, index, span) else sign
+                    if effective > 0:
+                        positive += weight
+                    else:
+                        negative += weight
+                    # One count per phrase per headline, as before: a headline
+                    # repeating "falls" twice is not twice as bearish.
+                    break
+
     total = positive + negative
     if total == 0:
         return 0.0
