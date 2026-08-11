@@ -40,6 +40,7 @@ from config import settings
 from db import Account, ClientProfile, Security
 from logging_setup import get_logger
 from services import tax_lots
+from services.broker import estimate_trading_cost, gross_purchase_cost, net_sale_proceeds
 from services.policy import ResolvedPolicy
 from services.portfolio import (
     DriftEntry,
@@ -118,13 +119,25 @@ class RebalancePlan:
     def estimated_tax(self) -> float:
         return sum(p.estimated_tax_cost or 0.0 for p in self.proposals)
 
+    def estimated_trading_cost(self) -> float:
+        """Slippage and commission across every leg, at the broker's own rates.
+
+        Previously invisible: tax was the only cost shown to the human asked to
+        approve the plan, so a high-turnover rebalance and a surgical one
+        looked equally cheap to execute.
+        """
+        return sum(estimate_trading_cost(p.notional, p.side) for p in self.proposals)
+
     def to_dict(self) -> Dict[str, object]:
+        trading_cost = self.estimated_trading_cost()
         return {
             "proposals": [p.to_dict() for p in sorted(self.proposals, key=lambda p: p.sequence)],
             "sell_count": len(self.sells),
             "buy_count": len(self.buys),
             "gross_notional": round(self.gross_notional(), 2),
             "estimated_tax_cost": round(self.estimated_tax(), 2),
+            "estimated_trading_cost": round(trading_cost, 2),
+            "estimated_total_cost": round(self.estimated_tax() + trading_cost, 2),
             "deferred": self.deferred,
             "notes": self.notes,
         }
@@ -305,7 +318,10 @@ def plan_rebalance(
             planned[(holding.account_id, holding.symbol)] = (
                 planned.get((holding.account_id, holding.symbol), 0.0) + filled
             )
-            proceeds += filled
+            # Only the *net* proceeds are spendable. `planned` above stays
+            # gross because it tracks how much exposure the trim removes,
+            # which is a position question, not a cash one.
+            proceeds += net_sale_proceeds(filled)
 
     # --- 2. Raise cash if it is below the floor ------------------------------
     cash_now = view.cash + proceeds
@@ -328,7 +344,8 @@ def plan_rebalance(
     for proposal in plan.proposals:
         if proposal.side == "SELL":
             cash_by_account[proposal.account_id] = (
-                cash_by_account.get(proposal.account_id, 0.0) + proposal.notional
+                cash_by_account.get(proposal.account_id, 0.0)
+                + net_sale_proceeds(proposal.notional)
             )
 
     # Hold the policy cash floor back from the largest balance rather than
@@ -433,7 +450,13 @@ def plan_rebalance(
             sector = _sector_of(symbol, reference)
             sector_room = _sector_headroom(view, sector, policy, planned, bought, reference)
 
-            amount = min(per_pick, headroom, sector_room, remaining, cash_by_account[account_id])
+            # Size against cash net of the cost of buying: an order for exactly
+            # the available balance overdraws by the commission and slippage
+            # the broker adds on top of the notional.
+            spendable = max(0.0, cash_by_account[account_id] - estimate_trading_cost(
+                cash_by_account[account_id], "BUY"
+            ))
+            amount = min(per_pick, headroom, sector_room, remaining, spendable)
             if amount < policy.min_position_notional:
                 if sector_room < policy.min_position_notional and sector:
                     # The case this catches is a rebalance undoing its own
@@ -474,7 +497,7 @@ def plan_rebalance(
 
             notional = quantity * price
             bought[symbol] = bought.get(symbol, 0.0) + notional
-            cash_by_account[account_id] -= notional
+            cash_by_account[account_id] -= gross_purchase_cost(notional)
             plan.proposals.append(
                 TradeProposalDraft(
                     symbol=symbol,

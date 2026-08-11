@@ -159,6 +159,35 @@ def get_broker() -> BrokerAdapter:
     return SimulatedBroker()
 
 
+def estimate_trading_cost(notional: float, side: str) -> float:
+    """What a trade of this size is expected to cost, before it is placed.
+
+    The same slippage and commission the simulator charges at fill time, so a
+    plan and its execution cannot disagree about the cost of trading. They did:
+    the planner credited a sell's full gross notional and spent it on buys,
+    while execution filled the sell 5 bps below the reference and the buy 5 bps
+    above, plus commission on both. Sized off gross, the buys could overdraw at
+    fill time -- and the only cost a human saw before approving was the tax.
+
+    Returns a positive number of dollars for either side.
+    """
+    if notional <= 0:
+        return 0.0
+    slippage = notional * settings.SIM_SLIPPAGE_BPS / 10_000.0
+    commission = max(settings.SIM_COMMISSION_MIN_USD, notional * settings.SIM_COMMISSION_BPS / 10_000.0)
+    return slippage + commission
+
+
+def net_sale_proceeds(notional: float) -> float:
+    """Cash a sale of `notional` is expected to actually deliver."""
+    return max(0.0, notional - estimate_trading_cost(notional, "SELL"))
+
+
+def gross_purchase_cost(notional: float) -> float:
+    """Cash a purchase of `notional` is expected to actually consume."""
+    return notional + estimate_trading_cost(notional, "BUY")
+
+
 def settlement_date(executed_at) -> "object":
     """T+1 in business days.
 
