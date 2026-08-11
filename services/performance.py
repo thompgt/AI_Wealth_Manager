@@ -304,6 +304,36 @@ def money_weighted_return(
     return (low + high) / 2
 
 
+def periods_per_year(dates: Sequence[datetime]) -> float:
+    """Annualization factor implied by the *observed* sampling cadence.
+
+    Snapshots are written on days a job ran, not every trading day, so the
+    return series between them is not a daily series. Scaling its standard
+    deviation by sqrt(252) regardless treats a weekly cadence as daily and
+    inflates reported volatility by roughly 2.2x, deflating Sharpe by the same
+    factor -- a portfolio made to look far riskier than it is by nothing more
+    than how often the job ran.
+
+    The median gap is used rather than the mean because one long outage
+    between snapshots should not redefine the cadence of the whole series.
+    """
+    if len(dates) < 2:
+        return float(TRADING_DAYS)
+
+    gaps = [
+        (dates[index] - dates[index - 1]).total_seconds() / 86400.0
+        for index in range(1, len(dates))
+    ]
+    gaps = [gap for gap in gaps if gap > 0]
+    if not gaps:
+        return float(TRADING_DAYS)
+
+    median_gap = float(np.median(gaps))
+    # Daily-or-denser sampling is capped at the trading-day count: calendar
+    # days are not trading days, and no series here is intraday.
+    return min(float(TRADING_DAYS), 365.25 / median_gap)
+
+
 def max_drawdown(returns: Sequence[float]) -> Optional[float]:
     """Worst peak-to-trough fall of a growth index built from period returns.
 
@@ -407,7 +437,7 @@ def compute_performance(
     result.money_weighted_return = money_weighted_return(irr_dates, irr_amounts)
 
     series = pd.Series(values, index=pd.to_datetime(dates))
-    # Flow-adjusted daily returns, so risk statistics are not driven by
+    # Flow-adjusted periodic returns, so risk statistics are not driven by
     # deposits. A wire transfer is not volatility.
     daily = []
     for index in range(1, len(values)):
@@ -415,8 +445,19 @@ def compute_performance(
         daily.append((values[index] - begin) / begin if begin > 0 else 0.0)
     returns = pd.Series(daily, index=series.index[1:])
 
+    # Annualize by the cadence actually observed rather than by assuming the
+    # series is daily -- snapshots exist only for days a job ran.
+    annualization = periods_per_year(dates)
+    if annualization < TRADING_DAYS * 0.9:
+        result.notes.append(
+            f"Valuations are spaced about {365.25 / annualization:.1f} calendar days apart, "
+            f"so annualized figures are scaled by {annualization:.0f} periods per year rather "
+            "than by a trading-day count. A sparser snapshot history makes these estimates "
+            "less precise, not more conservative."
+        )
+
     if len(returns) >= MIN_OBSERVATIONS_FOR_ANNUALIZED:
-        result.volatility = float(returns.std() * np.sqrt(TRADING_DAYS))
+        result.volatility = float(returns.std() * np.sqrt(annualization))
         if result.time_weighted_return is not None and result.days > 0:
             growth = 1.0 + result.time_weighted_return
             if growth > 0:
@@ -425,14 +466,14 @@ def compute_performance(
             result.sharpe_ratio = (result.annualized_return - risk_free_rate) / result.volatility
     else:
         result.notes.append(
-            f"{len(returns)} daily observations is too few to annualize; volatility, "
+            f"{len(returns)} periodic observations is too few to annualize; volatility, "
             f"Sharpe and annualized return need at least "
             f"{MIN_OBSERVATIONS_FOR_ANNUALIZED}. Cumulative return is reported instead."
         )
 
     result.max_drawdown = max_drawdown(daily)
 
-    _add_benchmark(db, client, result, dates, returns)
+    _add_benchmark(db, client, result, dates, returns, annualization)
     return result
 
 
@@ -442,12 +483,20 @@ def _add_benchmark(
     result: PerformanceResult,
     dates: Sequence[datetime],
     returns: pd.Series,
+    annualization: float,
 ) -> None:
     """Compare against the policy benchmark over the same window.
 
-    Uses the benchmark's own price history rather than the closes stored on
-    the snapshots, because a snapshot is only written on days a job ran, and a
+    The benchmark's *total* return over the window comes from its own daily
+    price history, because a snapshot is only written on days a job ran and a
     benchmark sampled on those days is not the benchmark's return.
+
+    Tracking error and beta are the opposite case: they are only meaningful
+    between two series measured over the same intervals. So the benchmark is
+    resampled onto the snapshot dates before its returns are differenced
+    against the portfolio's. Pairing a weekly portfolio return with a
+    single-day benchmark return, as this previously did, produces an active
+    return that is mostly the benchmark's missing days.
     """
     benchmark = _benchmark_for(db, client)
     result.benchmark_ticker = benchmark
@@ -476,7 +525,11 @@ def _add_benchmark(
     if result.time_weighted_return is not None:
         result.excess_return = result.time_weighted_return - result.benchmark_return
 
-    benchmark_returns = window.pct_change().dropna()
+    # Last close at or before each snapshot date, so both legs span the same
+    # intervals.
+    snapshot_index = pd.DatetimeIndex(pd.to_datetime(dates))
+    resampled = window.reindex(window.index.union(snapshot_index)).ffill().reindex(snapshot_index)
+    benchmark_returns = resampled.pct_change().dropna()
     aligned = pd.concat([returns, benchmark_returns], axis=1, join="inner").dropna()
     aligned.columns = ["portfolio", "benchmark"]
     # Below ~30 overlapping observations, tracking error and beta have
@@ -484,13 +537,13 @@ def _add_benchmark(
     # misleading precision.
     if len(aligned) < 30:
         result.notes.append(
-            f"Only {len(aligned)} trading days overlap between the portfolio's snapshots "
+            f"Only {len(aligned)} periods overlap between the portfolio's snapshots "
             "and the benchmark, which is too few for a reliable tracking error or beta."
         )
         return
 
     active = aligned["portfolio"] - aligned["benchmark"]
-    tracking_error = float(active.std() * np.sqrt(TRADING_DAYS))
+    tracking_error = float(active.std() * np.sqrt(annualization))
     result.tracking_error = tracking_error
     if tracking_error > 0 and result.excess_return is not None:
         result.information_ratio = result.excess_return / tracking_error
