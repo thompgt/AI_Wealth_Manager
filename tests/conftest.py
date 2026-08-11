@@ -135,6 +135,8 @@ def patched_external_calls(monkeypatch, fake_security_info):
     import agents.market_regime as market_regime
     import agents.rebalance as rebalance_agent
     import agents.stock_research as stock_research
+    import services.market_data as market_data
+    import services.portfolio as portfolio
     from services.llm import LLMUnavailable
     from services.news_service import NewsResult
 
@@ -158,6 +160,13 @@ def patched_external_calls(monkeypatch, fake_security_info):
     monkeypatch.setattr(market_regime, "get_market_news", fake_get_market_news)
     monkeypatch.setattr(stock_research, "get_quotes", fake_get_quotes)
     monkeypatch.setattr(rebalance_agent, "get_quotes", fake_get_quotes)
+    # services.portfolio.load_portfolio prices every holding, and it sits on
+    # the critical path of four nodes plus load_client_state. Leaving this seam
+    # open meant a test that looked fully stubbed still reached the live
+    # provider chain -- slow, non-deterministic, and a CI failure the moment
+    # the network or a vendor is unavailable.
+    monkeypatch.setattr(portfolio, "get_quotes", fake_get_quotes)
+    monkeypatch.setattr(market_data, "get_quotes", fake_get_quotes)
 
     for module in (market_regime, stock_research, finance_report):
         monkeypatch.setattr(module, "get_chat_model", unavailable_llm)
