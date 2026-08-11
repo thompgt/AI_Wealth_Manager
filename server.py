@@ -1400,12 +1400,25 @@ def list_orders(
 def get_performance(
     client_id: int,
     days: Optional[int] = Query(default=None, ge=1, le=3650),
+    include_reconstructed: bool = Query(
+        default=False,
+        description=(
+            "Include backfilled valuations, which apply current share counts to past "
+            "prices and are therefore survivorship-biased. The response flags this."
+        ),
+    ),
     principal: Principal = Depends(require("client:read")),
     db: Session = Depends(get_db),
 ):
     client = _get_client(db, client_id, principal)
     since = utcnow() - timedelta(days=days) if days else None
-    result = compute_performance(db, client, since=since, risk_free_rate=settings.RISK_FREE_RATE)
+    result = compute_performance(
+        db,
+        client,
+        since=since,
+        risk_free_rate=settings.RISK_FREE_RATE,
+        include_reconstructed=include_reconstructed,
+    )
     return {
         **result.to_dict(),
         "recommendation_scorecard": recommendation_scorecard(db, client),

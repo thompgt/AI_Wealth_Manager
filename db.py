@@ -771,6 +771,13 @@ class PortfolioSnapshot(Base):
     holdings_snapshot = Column(JSON, nullable=False, default=dict)
     benchmark_ticker = Column(String(24), nullable=True)
     benchmark_close = Column(Money, nullable=True)
+    # True for rows synthesised by `backfill_snapshots`, which apply *today's*
+    # share counts to past prices. Such a series only ever contains the
+    # positions the client still holds, so any return computed from it is
+    # survivorship-biased upwards. It is a column rather than a marker inside
+    # `holdings_snapshot` precisely so the query can exclude it, which
+    # `compute_performance` does by default.
+    is_reconstructed = Column(Boolean, nullable=False, default=False, index=True)
     created_at = Column(DateTime, nullable=False, default=utcnow)
 
     __table_args__ = (

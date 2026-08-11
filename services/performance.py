@@ -88,6 +88,9 @@ class PerformanceResult:
     beta_to_benchmark: Optional[float] = None
 
     insufficient_data: bool = False
+    # True when reconstructed (backfilled) valuations contributed to the
+    # figures above. Callers must not present such a result as measured.
+    includes_reconstructed: bool = False
     notes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, object]:
@@ -115,6 +118,7 @@ class PerformanceResult:
             "information_ratio": r(self.information_ratio, 3),
             "beta_to_benchmark": r(self.beta_to_benchmark, 3),
             "insufficient_data": self.insufficient_data,
+            "includes_reconstructed": self.includes_reconstructed,
             "notes": self.notes,
         }
 
@@ -193,6 +197,9 @@ def capture_snapshot(
         existing.holdings_snapshot = holdings_snapshot
         existing.benchmark_ticker = benchmark
         existing.benchmark_close = benchmark_close
+        # A real valuation overwriting a backfilled one for the same date is a
+        # promotion: the row is now measured, not reconstructed.
+        existing.is_reconstructed = False
         db.flush()
         return existing
 
@@ -303,17 +310,39 @@ def compute_performance(
     *,
     since: Optional[datetime] = None,
     risk_free_rate: float = 0.04,
+    include_reconstructed: bool = False,
 ) -> PerformanceResult:
-    """Full return and risk profile over the available snapshot history."""
+    """Full return and risk profile over the available snapshot history.
+
+    Reconstructed snapshots are excluded unless explicitly asked for. They
+    apply today's holdings to past prices, so a return computed from them is
+    the "if I had always held my winners" number, not measured performance.
+    When they are included, the result says so in `notes` and sets
+    `includes_reconstructed`, so a caller cannot present the figure as
+    measured without the caveat travelling alongside it.
+    """
     result = PerformanceResult()
 
     query = db.query(PortfolioSnapshot).filter(
         PortfolioSnapshot.client_id == client.id,
         PortfolioSnapshot.account_id.is_(None),
     )
+    if not include_reconstructed:
+        query = query.filter(PortfolioSnapshot.is_reconstructed.is_(False))
     if since:
         query = query.filter(PortfolioSnapshot.as_of >= since)
     snapshots = query.order_by(PortfolioSnapshot.as_of.asc()).all()
+
+    reconstructed_count = sum(1 for s in snapshots if s.is_reconstructed)
+    if reconstructed_count:
+        result.includes_reconstructed = True
+        result.notes.append(
+            f"{reconstructed_count} of {len(snapshots)} valuations are reconstructed: they "
+            "apply the client's current share counts to historical prices, so they describe "
+            "what today's portfolio would have done rather than what was actually held. "
+            "Every return, risk and attribution figure below inherits that survivorship bias "
+            "and must not be presented as measured performance."
+        )
 
     if len(snapshots) < 2:
         result.insufficient_data = True
@@ -723,6 +752,11 @@ def backfill_snapshots(
     have done, not what the client actually held. That makes it useful for
     context on a new client and wrong for a performance claim. Real snapshots
     take over from the day the job first runs.
+
+    The label is the `is_reconstructed` column, which `compute_performance`
+    filters on by default. A marker buried inside `holdings_snapshot` was not
+    enough: nothing could query it, so these rows silently fed the reported
+    return with a "if I had always held my winners" bias.
     """
     view = load_portfolio(db, client)
     if not view.holdings:
@@ -743,11 +777,18 @@ def backfill_snapshots(
             hour=0, minute=0, second=0, microsecond=0, tzinfo=None
         )
         value = view.cash
+        holdings_snapshot: Dict[str, Dict[str, float]] = {}
         for symbol, quantity in quantities.items():
             price = row.get(symbol)
             if price is None or pd.isna(price):
                 continue
-            value += quantity * float(price)
+            position_value = quantity * float(price)
+            value += position_value
+            holdings_snapshot[symbol] = {
+                "quantity": round(quantity, 6),
+                "price": round(float(price), 4),
+                "value": round(position_value, 2),
+            }
 
         exists = (
             db.query(PortfolioSnapshot)
@@ -769,7 +810,8 @@ def backfill_snapshots(
                 market_value=Decimal(str(round(value, 6))),
                 cash_value=Decimal(str(round(view.cash, 6))),
                 net_flow=Decimal("0"),
-                holdings_snapshot={"_reconstructed": True},
+                holdings_snapshot=holdings_snapshot,
+                is_reconstructed=True,
             )
         )
         created += 1
