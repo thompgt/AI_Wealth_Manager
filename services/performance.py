@@ -304,6 +304,32 @@ def money_weighted_return(
     return (low + high) / 2
 
 
+def max_drawdown(returns: Sequence[float]) -> Optional[float]:
+    """Worst peak-to-trough fall of a growth index built from period returns.
+
+    Deliberately takes returns rather than market values. Run on the raw
+    market-value series, a client withdrawing 30% of the account books a 30%
+    drawdown and the portfolio is blamed for a wire transfer -- while the
+    volatility and TWR reported beside it go to some trouble to neutralize
+    exactly those flows. The returns handed in here are already flow-adjusted,
+    so the index they compound is what the strategy did.
+
+    Returns a non-positive number, or None when there is nothing to measure.
+    """
+    if not len(returns):
+        return None
+
+    level = 1.0
+    peak = 1.0
+    worst = 0.0
+    for period_return in returns:
+        level *= 1.0 + period_return
+        peak = max(peak, level)
+        if peak > 0:
+            worst = min(worst, level / peak - 1.0)
+    return worst
+
+
 def compute_performance(
     db: Session,
     client: ClientProfile,
@@ -404,9 +430,7 @@ def compute_performance(
             f"{MIN_OBSERVATIONS_FOR_ANNUALIZED}. Cumulative return is reported instead."
         )
 
-    running_max = series.cummax()
-    drawdown = (series / running_max - 1.0).min()
-    result.max_drawdown = float(drawdown) if drawdown == drawdown else None
+    result.max_drawdown = max_drawdown(daily)
 
     _add_benchmark(db, client, result, dates, returns)
     return result
