@@ -627,8 +627,42 @@ def record_recommendations(
     return created
 
 
+# How far before the target date a close may sit and still be accepted as
+# "the price at the horizon". Long weekends and market holidays make an exact
+# match impossible; a gap wider than this means the history is missing rather
+# than merely non-trading, and the outcome is voided instead of scored.
+_HORIZON_PRICE_TOLERANCE_DAYS = 7
+
+
+def _close_at(prices: pd.Series, target: datetime) -> Optional[float]:
+    """The last close at or before `target`, if one exists close enough to it.
+
+    Scoring a horizon needs the price *on that date*, not the latest price. The
+    two are the same only if the job runs the day the horizon elapses, which
+    is exactly the assumption that turned a 30-day recommendation evaluated
+    200 days late into a 200-day return filed under `horizon_days=30`.
+    """
+    if prices.empty:
+        return None
+    window = prices[prices.index <= pd.Timestamp(target)]
+    if window.empty:
+        return None
+    gap = pd.Timestamp(target) - window.index[-1]
+    if gap > pd.Timedelta(days=_HORIZON_PRICE_TOLERANCE_DAYS):
+        return None
+    value = float(window.iloc[-1])
+    return value if value > 0 else None
+
+
 def evaluate_outcomes(db: Session, *, as_of: Optional[datetime] = None, limit: int = 500) -> int:
-    """Score recommendations whose horizon has elapsed.
+    """Score recommendations whose horizon has elapsed, at the horizon's price.
+
+    Both legs are read at the same two dates — the recommendation date and the
+    recommendation date plus the horizon — so a 30-day outcome is a 30-day
+    return however late the evaluation job happens to run, and the benchmark
+    window covers the same span rather than starting whenever history began.
+    If either leg has no close near the horizon date the outcome is voided:
+    an unscoreable recommendation is not a zero-return one.
 
     Excess return against the benchmark is the figure that matters. A pick
     that returned 8% while the index returned 12% was a bad call, and a raw
@@ -651,38 +685,47 @@ def evaluate_outcomes(db: Session, *, as_of: Optional[datetime] = None, limit: i
         return 0
 
     symbols = sorted({o.symbol for o in due})
-    benchmarks = sorted({_benchmark_for(db, o.client) for o in due if o.client})
-    quotes = get_quotes(symbols + [b for b in benchmarks if b])
+    benchmarks = sorted({b for b in (_benchmark_for(db, o.client) for o in due if o.client) if b})
+
+    # One fetch spanning the oldest recommendation, rather than a per-outcome
+    # fetch sized to the horizon: the old sizing started the benchmark window
+    # *after* the recommendation for anything evaluated late, which is what
+    # made excess return meaningless.
+    oldest = min(o.recommended_at for o in due)
+    span_years = max(0.2, ((as_of - oldest).days + 10) / 365.0)
+    history = fetch_historical_prices(symbols + benchmarks, years=span_years)
+
+    def series_for(ticker: str) -> pd.Series:
+        if history.empty or ticker not in history.columns:
+            return pd.Series(dtype=float)
+        return history[ticker].dropna()
 
     evaluated = 0
     for outcome in due:
-        quote = quotes.get(outcome.symbol)
         entry = to_float(outcome.entry_price)
-        if quote is None or entry <= 0:
+        target = outcome.recommended_at + timedelta(days=outcome.horizon_days)
+        exit_price = _close_at(series_for(outcome.symbol), target)
+
+        if entry <= 0 or exit_price is None:
             # Cannot be scored: mark it void rather than leaving it open
             # forever, and never guess a return.
             outcome.status = "void"
             outcome.evaluated_at = as_of
             continue
 
-        outcome.exit_price = Decimal(str(round(quote.price, 6)))
-        outcome.return_pct = round(quote.price / entry - 1.0, 6)
+        outcome.exit_price = Decimal(str(round(exit_price, 6)))
+        outcome.return_pct = round(exit_price / entry - 1.0, 6)
 
         benchmark = _benchmark_for(db, outcome.client) if outcome.client else None
         if benchmark:
-            history = fetch_historical_prices(
-                [benchmark], years=max(0.1, outcome.horizon_days / 365.0 + 0.1)
-            )
-            if not history.empty and benchmark in history.columns:
-                prices = history[benchmark].dropna()
-                window = prices[prices.index >= pd.Timestamp(outcome.recommended_at)]
-                if len(window) >= 2:
-                    outcome.benchmark_return_pct = round(
-                        float(window.iloc[-1] / window.iloc[0] - 1.0), 6
-                    )
-                    outcome.excess_return_pct = round(
-                        outcome.return_pct - outcome.benchmark_return_pct, 6
-                    )
+            prices = series_for(benchmark)
+            benchmark_entry = _close_at(prices, outcome.recommended_at)
+            benchmark_exit = _close_at(prices, target)
+            if benchmark_entry and benchmark_exit:
+                outcome.benchmark_return_pct = round(benchmark_exit / benchmark_entry - 1.0, 6)
+                outcome.excess_return_pct = round(
+                    outcome.return_pct - outcome.benchmark_return_pct, 6
+                )
 
         outcome.status = "evaluated"
         outcome.evaluated_at = as_of
