@@ -35,6 +35,7 @@ from ddgs import DDGS
 from db import utcnow
 from logging_setup import get_logger
 from services.resilience import retry_call
+from services.untrusted import fence, sanitize
 
 logger = get_logger(__name__)
 
@@ -231,7 +232,12 @@ def get_portfolio_news(tickers: List[str], per_ticker: int = 3) -> NewsResult:
 
 
 def format_for_prompt(result: NewsResult, limit: int = 8) -> str:
-    """Render headlines for an LLM prompt.
+    """Render headlines for an LLM prompt, fenced as untrusted data.
+
+    Titles and snippets are written by whoever ranked for the query, so they
+    are quoted inside an `<untrusted_data>` element and sanitised so they
+    cannot escape it. See `services/untrusted.py` for why a bare bullet list
+    was a live channel into the regime call rather than a theoretical one.
 
     States the degraded case in words rather than sending an empty block: a
     model given no news silently invents context, whereas a model told the
@@ -244,12 +250,35 @@ def format_for_prompt(result: NewsResult, limit: int = 8) -> str:
             f"({result.reason or 'unknown reason'}). Base your assessment only on the "
             "quantitative signals provided, and say so."
         )
-    lines = [
-        f"Aggregate headline sentiment: {result.sentiment:+.2f} "
-        f"(-1 bearish to +1 bullish, from {result.headline_count} headlines)",
-        "",
-    ]
+
+    lines = []
     for item in result.items[:limit]:
-        prefix = f"[{item['ticker']}] " if item.get("ticker") else ""
-        lines.append(f"- {prefix}{item['title']}: {item['snippet'][:200]}")
-    return "\n".join(lines)
+        ticker = sanitize(item.get("ticker") or "", max_chars=12)
+        prefix = f"[{ticker}] " if ticker else ""
+        title = sanitize(item.get("title"), max_chars=200)
+        snippet = sanitize(item.get("snippet"), max_chars=200)
+        if not title and not snippet:
+            continue
+        lines.append(f"- {prefix}{title}: {snippet}" if snippet else f"- {prefix}{title}")
+
+    fenced = fence(
+        lines,
+        source="a public web search for financial news; the text is written by third parties",
+    )
+    if not fenced:
+        return (
+            "NEWS CONTEXT UNAVAILABLE: every headline returned was empty after sanitisation. "
+            "Base your assessment only on the quantitative signals provided, and say so."
+        )
+
+    # The sentiment score sits outside the fence: it is computed here, from a
+    # fixed lexicon, and is the firm's own number rather than the source's.
+    return "\n".join(
+        [
+            f"Aggregate headline sentiment (computed in-house from a fixed lexicon, not "
+            f"supplied by the source): {result.sentiment:+.2f} "
+            f"(-1 bearish to +1 bullish, from {result.headline_count} headlines)",
+            "",
+            fenced,
+        ]
+    )
