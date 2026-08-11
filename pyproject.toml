@@ -1,0 +1,31 @@
+[tool.pytest.ini_options]
+# Discovery was resting entirely on tests/conftest.py inserting the repo root
+# into sys.path, which works when pytest is invoked from the repo root and
+# nowhere else -- so a CI job, a container entrypoint or an editor's test
+# runner could each fail to import the package for a different reason.
+# `pythonpath` states it instead.
+#
+# conftest.py still sets the environment (a temp database, a dummy key)
+# because that must happen before db.py builds its engine at import time,
+# which is earlier than any fixture can run.
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers --strict-config"
+# Fail on an unraisable exception rather than printing it and moving on -- a
+# background thread dying in the job worker should not look like a pass.
+filterwarnings = [
+    "ignore::DeprecationWarning:starlette.*",
+    "ignore::DeprecationWarning:httpx.*",
+]
+
+[tool.ruff]
+line-length = 100
+# The demo notebook is prose-first: its imports deliberately follow the
+# narration rather than sitting in one block at the top.
+extend-exclude = ["demo.ipynb", ".venv", "alembic/versions"]
+
+# Rule selection is left at ruff's default (pyflakes plus the pycodestyle
+# errors that catch real bugs). Turning on the import-sorting or full
+# pycodestyle sets would flag a hundred pre-existing style points across the
+# tree, which is a reformatting project rather than a lint gate, and a CI
+# check nobody can pass on day one is a check that gets disabled.

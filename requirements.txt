@@ -70,5 +70,6 @@ anywidget==0.11.0
 # exporter, and installing them to run the server is a slower, larger image
 # for a file the server never opens.
 
-# Testing
+# Testing and linting
 pytest==9.1.1
+ruff==0.14.6
