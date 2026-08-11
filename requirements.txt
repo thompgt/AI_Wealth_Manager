@@ -43,9 +43,12 @@ pyjwt==2.12.1
 prometheus-client==0.24.1
 
 # Analytics
+# No PyPortfolioOpt. It was pinned here and never imported -- the Sharpe,
+# volatility and drawdown figures are computed directly in agents/diagnostics.py
+# and services/performance.py -- while dragging in cvxpy and osqp, a build
+# chain that breaks on new Python releases, for nothing.
 numpy==2.5.1
 pandas==3.0.3
-PyPortfolioOpt==1.6.0
 yfinance==1.5.1
 
 # News / research
@@ -62,12 +65,10 @@ plotly==6.9.0
 # smoke test that stops at the client list never sees it.
 anywidget==0.11.0
 
-# Demo notebook / static chart export
-nbformat==5.10.4
-nbclient==0.11.0
-ipykernel==7.3.0
-kaleido==1.3.0
+# The demo notebook's dependencies are in requirements-notebook.txt. Nothing
+# the API or dashboard imports needs a Jupyter kernel or a static image
+# exporter, and installing them to run the server is a slower, larger image
+# for a file the server never opens.
 
 # Testing
 pytest==9.1.1
-pytest-asyncio==1.4.0

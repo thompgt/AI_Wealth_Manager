@@ -36,6 +36,9 @@ pip install -r requirements.txt
 cp .env.example .env              # optional: add a GEMINI_API_KEY
 
 python demo_data.py               # seed a demo client
+
+# The notebook needs a Jupyter kernel and kaleido, which the service does not:
+pip install -r requirements-notebook.txt
 jupyter lab demo.ipynb            # run the live demo
 ```
 
@@ -257,7 +260,7 @@ approval round trip. Agents never call the network directly; everything goes thr
 | `services/jobs.py` | Durable job queue: a `jobs` table plus a worker thread pool. Claiming is a conditional `UPDATE` so two workers cannot take the same row, and a worker that dies mid-run stops heartbeating and has its job reclaimed. No Redis, no Celery. |
 | `services/run_service.py` | The seam between the graph and the database: persists the audit trail per node (deduplicated, so a resumed run does not double-write), stores rejected reports marked rejected, records recommendations for outcome scoring, and captures a portfolio snapshot at the end of each run. Executes no trades. |
 | `app.py` | Solara dashboard. Holds no business logic — it is an HTTP client of `server.py`, including the approval round trip. |
-| `agents/diagnostics.py` | Valuation, concentration, sector exposure, Sharpe/return/volatility via PyPortfolioOpt, scored against the client's risk tier. |
+| `agents/diagnostics.py` | Valuation, concentration, sector exposure, and Sharpe/return/volatility computed directly from the price history, scored against the client's risk tier. |
 | `agents/market_regime.py` | Deterministic macro trend signals, then LLM classification grounded in them. Fail-safe to `Volatile`/0.0. |
 | `agents/stock_research.py` | Flaw-driven screen over `CANDIDATE_UNIVERSE`, relative-valuation filter, ranking, and consumption of retry feedback. |
 | `agents/suitability.py` | Security-quality, beta, and position-cap rules; then dollar sizing by confidence weight, water-filling around each cap. No LLM. |
@@ -271,7 +274,7 @@ approval round trip. Agents never call the network directly; everything goes thr
 
 | Agent | LLM? | What it does |
 |---|---|---|
-| **Portfolio Diagnostics** | No | Values holdings at live prices; computes concentration, sector exposure, and Sharpe/return/volatility via PyPortfolioOpt. Scores all of it against the client's own risk tier. |
+| **Portfolio Diagnostics** | No | Values holdings at live prices; computes concentration, sector exposure, and Sharpe/return/volatility from the price history. Scores all of it against the client's own risk tier. |
 | **Market Regime** | Hybrid | Computes auditable trend signals from 12 macro tickers and 5 ratio pairs, then has an LLM classify the regime *grounded in those signals*. Fails to `Volatile`/confidence 0.0 — never an optimistic default. |
 | **Stock Research** | Yes | Screens a curated 34-name universe driven by the *diagnosed flaws*, filters on relative valuation, and ranks. Every candidate must name the flaw it addresses. |
 | **Suitability** | **No** | Security quality (≥ $2B cap, major exchange, verifiable data), a near-retirement beta ceiling, and risk-tier position caps. Then sizes survivors from available cash by confidence weight, water-filling around each cap. |
