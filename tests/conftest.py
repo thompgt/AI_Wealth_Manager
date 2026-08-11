@@ -51,83 +51,113 @@ def make_price_frame(tickers, days=130, start_price=100.0, daily_drift=0.001):
     return pd.DataFrame(data, index=index)
 
 
-class FakeTicker:
-    """Stand-in for yfinance.Ticker -- returns a fixed, reasonable .info dict
-    so suitability/diagnostics/stock_research pure-logic paths can run
-    without any network access."""
+def make_security_info(symbol, **overrides):
+    """A reasonable, eligible SecurityInfo, so suitability's screens pass
+    unless a test deliberately makes them fail."""
+    from services.providers.base import SecurityInfo
 
-    DEFAULT_INFO = {
+    fields = {
+        "symbol": symbol,
+        "name": f"{symbol} Inc.",
         "sector": "Technology",
-        "marketCap": 500_000_000_000,
+        "industry": "Software",
         "exchange": "NMS",
-        "fullExchangeName": "Nasdaq Global Select",
+        "market_cap": 500_000_000_000.0,
         "beta": 1.0,
-        "trailingPE": 20.0,
-        "priceToBook": 5.0,
-        "dividendYield": 1.8,
+        "pe_ratio": 20.0,
+        "pb_ratio": 5.0,
+        "dividend_yield": 1.8,
+        "avg_dollar_volume": 500_000_000.0,
+        "quote_type": "EQUITY",
+        "provider": "test",
     }
-
-    def __init__(self, symbol):
-        self.symbol = symbol
-
-    @property
-    def info(self):
-        return dict(self.DEFAULT_INFO)
+    fields.update(overrides)
+    return SecurityInfo(**{k: v for k, v in fields.items() if k in SecurityInfo.__dataclass_fields__})
 
 
 @pytest.fixture
-def fake_yfinance(monkeypatch):
-    """Patch the single place that now talks to yfinance for ticker metadata.
+def fake_security_info(monkeypatch):
+    """Offline reference data.
 
-    All three agents used to call `yf.Ticker(...).info` themselves, so this
-    fixture had to patch three module-level `yf` references. They now share
-    services.market_data.get_ticker_info, so there is exactly one seam -- and
-    its in-process cache has to be cleared around each test so a real lookup
-    from another test can't leak in (or a fake one leak out).
+    Market data moved behind a provider chain, so the old seam -- patching
+    `yfinance.Ticker` on services.market_data -- no longer exists; there is no
+    `yf` attribute on that module at all. The seam now is `get_security_info`,
+    patched both where it is defined and where `agents.suitability` bound it by
+    name at import time. Its in-process cache is cleared around each test so a
+    real lookup cannot leak in (or a fake one leak out).
     """
+    import agents.suitability as suitability
     import services.market_data as market_data
 
     market_data.clear_ticker_info_cache()
-    monkeypatch.setattr(market_data.yf, "Ticker", FakeTicker)
+
+    def fake_get_security_info(ticker):
+        return make_security_info(str(ticker).upper())
+
+    monkeypatch.setattr(market_data, "get_security_info", fake_get_security_info)
+    monkeypatch.setattr(suitability, "get_security_info", fake_get_security_info)
     yield
     market_data.clear_ticker_info_cache()
 
 
+def make_quote(symbol, price=250.0):
+    from services.providers.base import Quote
+
+    return Quote(symbol=symbol, price=price, provider="test", as_of=_pd_now())
+
+
+def _pd_now():
+    import datetime as _dt
+
+    return _dt.datetime.now().replace(microsecond=0)
+
+
 @pytest.fixture
-def patched_external_calls(monkeypatch, fake_yfinance):
+def patched_external_calls(monkeypatch, fake_security_info):
     """
     Full offline double for every network/LLM dependency the orchestrator's
     graph touches, so the E2E graph test is deterministic and doesn't require
-    a live GEMINI_API_KEY or internet access. Each agent module imports these
-    helpers by name at module load time (`from services.market_data import
-    fetch_historical_prices`), so every import site must be patched
-    individually -- patching services.market_data itself would not affect
-    already-bound references in agents/*.py.
+    a live GEMINI_API_KEY or internet access.
+
+    Each agent module imports these helpers by name at module load time
+    (`from services.market_data import fetch_historical_prices`), so every
+    import site must be patched individually -- patching services.market_data
+    itself would not affect references already bound in agents/*.py.
+
+    The LLM is disabled at `get_chat_model` rather than at each agent's own
+    call wrapper. Those wrappers have been renamed more than once, and a
+    monkeypatch naming a function that no longer exists fails loudly at setup
+    -- but only after the rename, which is how this fixture came to reference
+    three functions that had all been gone for a while.
     """
     import agents.diagnostics as diagnostics
     import agents.finance_report as finance_report
     import agents.market_regime as market_regime
+    import agents.rebalance as rebalance_agent
     import agents.stock_research as stock_research
-    import agents.tax_awareness as tax_awareness
-    import orchestrator
+    from services.llm import LLMUnavailable
+    from services.news_service import NewsResult
 
     def fake_fetch_historical_prices(tickers, years=1):
         return make_price_frame(tickers, days=130)
 
-    def fake_get_current_prices(tickers):
-        return {t: 250.0 for t in tickers}
+    def fake_get_quotes(tickers, **kwargs):
+        return {t: make_quote(t) for t in tickers if str(t).upper() != "CASH"}
 
-    def fail_llm(*args, **kwargs):
-        raise RuntimeError("LLM disabled in tests -- exercising the deterministic fallback path")
+    def unavailable_llm(*args, **kwargs):
+        raise LLMUnavailable(
+            "LLM disabled in tests -- exercising the deterministic fallback path"
+        )
 
-    def fake_search_financial_news(keywords, max_results=5):
-        return []
+    def fake_get_market_news(keywords=None, max_results=6):
+        return NewsResult(degraded=True, reason="news disabled in tests")
 
     monkeypatch.setattr(diagnostics, "fetch_historical_prices", fake_fetch_historical_prices)
     monkeypatch.setattr(market_regime, "fetch_historical_prices", fake_fetch_historical_prices)
-    monkeypatch.setattr(market_regime, "search_financial_news", fake_search_financial_news)
-    monkeypatch.setattr(market_regime, "_invoke_llm", fail_llm)
-    monkeypatch.setattr(stock_research, "_llm_rank", fail_llm)
-    monkeypatch.setattr(finance_report, "_call_llm", fail_llm)
-    monkeypatch.setattr(tax_awareness, "get_current_prices", fake_get_current_prices)
-    monkeypatch.setattr(orchestrator, "get_current_prices", fake_get_current_prices)
+    monkeypatch.setattr(stock_research, "fetch_historical_prices", fake_fetch_historical_prices)
+    monkeypatch.setattr(market_regime, "get_market_news", fake_get_market_news)
+    monkeypatch.setattr(stock_research, "get_quotes", fake_get_quotes)
+    monkeypatch.setattr(rebalance_agent, "get_quotes", fake_get_quotes)
+
+    for module in (market_regime, stock_research, finance_report):
+        monkeypatch.setattr(module, "get_chat_model", unavailable_llm)

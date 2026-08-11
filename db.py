@@ -45,6 +45,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    false,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
@@ -784,7 +785,12 @@ class PortfolioSnapshot(Base):
     # survivorship-biased upwards. It is a column rather than a marker inside
     # `holdings_snapshot` precisely so the query can exclude it, which
     # `compute_performance` does by default.
-    is_reconstructed = Column(Boolean, nullable=False, default=False, index=True)
+    # server_default matches the migration so `alembic check` stays clean: the
+    # column is NOT NULL and was added to a populated table, which needs a
+    # default at the database level, and a model that omits it reads as drift.
+    is_reconstructed = Column(
+        Boolean, nullable=False, default=False, server_default=false(), index=True
+    )
     created_at = Column(DateTime, nullable=False, default=utcnow)
 
     __table_args__ = (
