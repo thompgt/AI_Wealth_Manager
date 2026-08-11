@@ -57,6 +57,12 @@ _ROLE_PREFIX = re.compile(
     r"^\s*(?:#+|-{3,}|={3,}|\[/?[A-Z_]+\]|(?:system|assistant|user|human|ai)\s*:)\s*",
     re.IGNORECASE,
 )
+# The same role labels *anywhere* in the span. Stripping only a leading label
+# is not enough: any residue in front of it -- the tag name left behind by a
+# forged "</prompt>", say -- shields it from an anchored pattern. The colon is
+# what makes "System:" read as the start of a conversational turn, so dropping
+# just the colon defuses the pattern while leaving the sentence readable.
+_ROLE_ANYWHERE = re.compile(r"\b(system|assistant|user|human|ai)\s*:", re.IGNORECASE)
 
 _LEADING_PUNCT = re.compile(r"^[\s/\\|*_~\-=#>\[\]{}()]+")
 
@@ -90,7 +96,8 @@ def sanitize(text: Optional[str], *, max_chars: int = MAX_ITEM_CHARS) -> str:
         cleaned = _ROLE_PREFIX.sub("", cleaned)
         if cleaned == before:
             break
-    cleaned = cleaned.strip()
+    cleaned = _ROLE_ANYWHERE.sub(r"\1 ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
 
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars].rstrip() + "..."
