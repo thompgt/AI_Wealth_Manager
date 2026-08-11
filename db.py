@@ -562,6 +562,13 @@ class InvestmentPolicy(Base):
     lot_selection_method = Column(String(16), nullable=False, default="HIFO")  # HIFO | FIFO | LIFO
     harvest_losses = Column(Boolean, nullable=False, default=True)
     max_short_term_gain_budget = Column(Money, nullable=True)
+    # The client's marginal rates, used to estimate the tax cost of a sale.
+    # These live on the versioned policy rather than on the client record
+    # because the estimate is not merely informational: it gates trades, so
+    # the rate that produced a decision has to be reproducible from the same
+    # version number the rest of the decision was made against.
+    marginal_tax_rate = Column(Float, nullable=True)  # ordinary income / short-term
+    capital_gains_tax_rate = Column(Float, nullable=True)  # long-term
 
     benchmark_ticker = Column(String(24), nullable=False, default="SPY")
     rebalance_frequency_days = Column(Integer, nullable=False, default=90)

@@ -56,6 +56,13 @@ LONG_TERM_DAYS = 365
 
 LOT_METHODS = ("HIFO", "FIFO", "LIFO", "MINTAX")
 
+# Used only when the client's policy records no rate. Deliberately the top
+# bracket -- an unknown rate should over-state the tax cost rather than
+# under-state it -- but every caller that gates a decision on the estimate is
+# expected to say the rate was assumed. See SaleEstimate.estimated_tax.
+TOP_MARGINAL_RATE = 0.37
+TOP_CAPITAL_GAINS_RATE = 0.20
+
 
 @dataclass
 class LotSelection:
@@ -94,15 +101,28 @@ class SaleEstimate:
     wash_sale_note: Optional[str] = None
     shortfall: float = 0.0  # requested quantity beyond what is held
 
-    def estimated_tax(self, short_rate: float = 0.37, long_rate: float = 0.20) -> float:
+    def estimated_tax(
+        self,
+        short_rate: Optional[float] = None,
+        long_rate: Optional[float] = None,
+    ) -> float:
         """Rough tax owed. Positive means a cost, negative means a benefit.
 
-        Deliberately a blunt estimate at top marginal rates: this is used to
-        *rank* trades by tax cost, not to file anything. Pretending to
-        precision here -- state tax, NIIT, bracket position, carryforwards --
-        would imply an accuracy the system does not have and cannot verify.
+        Still blunt -- state tax, NIIT, bracket position and carryforwards are
+        not modelled, and pretending otherwise would imply an accuracy the
+        system cannot verify. What changed is the default. Falling back to the
+        top marginal rates for every client was defensible while this only
+        *ranked* trades, but the rebalancer withholds any trim whose estimated
+        tax exceeds 25% of the trade, which makes it a hard gate. For a client
+        in the 22% bracket the old default over-estimated by about 70% and
+        suppressed concentration fixes they should have been making.
+
+        `rates_are_assumed` records whether real rates were supplied, so the
+        assumption travels with the number instead of being invisible.
         """
-        return self.short_term_gain * short_rate + self.long_term_gain * long_rate
+        short = TOP_MARGINAL_RATE if short_rate is None else short_rate
+        long = TOP_CAPITAL_GAINS_RATE if long_rate is None else long_rate
+        return self.short_term_gain * short + self.long_term_gain * long
 
     def to_dict(self) -> Dict[str, object]:
         return {

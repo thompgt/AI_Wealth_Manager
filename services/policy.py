@@ -138,6 +138,11 @@ class ResolvedPolicy:
 
     benchmark_ticker: str
     rebalance_frequency_days: int
+    # None means "no rate on file", which the tax module answers with the top
+    # marginal rates *and* a warning -- not silently, because that assumption
+    # withholds trades a lower-bracket client should be making.
+    marginal_tax_rate: Optional[float] = None
+    capital_gains_tax_rate: Optional[float] = None
     approved_by_user_id: Optional[int] = None
     approved_at: Optional[Any] = None
     notes: Optional[str] = None
@@ -257,6 +262,8 @@ def resolve(db: Session, client: ClientProfile) -> ResolvedPolicy:
             ),
             benchmark_ticker=policy.benchmark_ticker,
             rebalance_frequency_days=policy.rebalance_frequency_days,
+            marginal_tax_rate=policy.marginal_tax_rate,
+            capital_gains_tax_rate=policy.capital_gains_tax_rate,
             approved_by_user_id=policy.approved_by_user_id,
             approved_at=policy.approved_at,
             notes=policy.notes,
@@ -300,6 +307,8 @@ def resolve(db: Session, client: ClientProfile) -> ResolvedPolicy:
         max_short_term_gain_budget=merged.get("max_short_term_gain_budget"),
         benchmark_ticker=merged.get("benchmark_ticker", "SPY"),
         rebalance_frequency_days=int(merged.get("rebalance_frequency_days", 90)),
+        marginal_tax_rate=merged.get("marginal_tax_rate"),
+        capital_gains_tax_rate=merged.get("capital_gains_tax_rate"),
         warnings=warnings,
     )
 
@@ -350,6 +359,8 @@ def draft_policy(
         "max_short_term_gain_budget": current.max_short_term_gain_budget,
         "benchmark_ticker": current.benchmark_ticker,
         "rebalance_frequency_days": current.rebalance_frequency_days,
+        "marginal_tax_rate": current.marginal_tax_rate,
+        "capital_gains_tax_rate": current.capital_gains_tax_rate,
         "notes": None,
     }
     fields.update({k: v for k, v in overrides.items() if k in fields})
@@ -413,6 +424,24 @@ def validate_policy(policy: InvestmentPolicy) -> List[str]:
 
     if policy.lot_selection_method not in ("HIFO", "FIFO", "LIFO"):
         problems.append(f"lot_selection_method {policy.lot_selection_method!r} is not supported.")
+
+    for label, rate in (
+        ("marginal_tax_rate", policy.marginal_tax_rate),
+        ("capital_gains_tax_rate", policy.capital_gains_tax_rate),
+    ):
+        if rate is not None and not 0 <= float(rate) <= 1:
+            problems.append(f"{label} must be a fraction between 0 and 1, not {rate!r}.")
+    if (
+        policy.marginal_tax_rate is not None
+        and policy.capital_gains_tax_rate is not None
+        and float(policy.capital_gains_tax_rate) > float(policy.marginal_tax_rate)
+    ):
+        problems.append(
+            f"capital_gains_tax_rate ({float(policy.capital_gains_tax_rate):.0%}) exceeds "
+            f"marginal_tax_rate ({float(policy.marginal_tax_rate):.0%}); long-term gains are "
+            "not taxed above ordinary income, so this would make the lot selector prefer "
+            "short-term gains."
+        )
 
     return problems
 

@@ -214,6 +214,18 @@ def plan_rebalance(
         s.ticker: s for s in db.query(Security).filter(Security.is_active.is_(True)).all()
     }
 
+    rates_on_file = (
+        policy.marginal_tax_rate is not None or policy.capital_gains_tax_rate is not None
+    )
+    if not rates_on_file:
+        plan.notes.append(
+            "No marginal tax rate is on file for this client, so tax cost is estimated at "
+            "top-bracket rates (37% short-term, 20% long-term). That estimate withholds "
+            "trims whose tax exceeds 25% of the trade, so for a client in a lower bracket "
+            "it can suppress concentration fixes that are worth making. Recording the "
+            "client's rates on their investment policy removes the assumption."
+        )
+
     # --- 1. Trim positions and sectors over their limits ---------------------
     #
     # Breaches overlap: a portfolio that is 51% AAPL and 100% Technology
@@ -266,12 +278,31 @@ def plan_rebalance(
                 holding.price,
                 method=policy.lot_selection_method,
             )
-            tax_cost = estimate.estimated_tax() if account.tax_treatment == "taxable" else 0.0
+            tax_cost = (
+                estimate.estimated_tax(
+                    policy.marginal_tax_rate, policy.capital_gains_tax_rate
+                )
+                if account.tax_treatment == "taxable"
+                else 0.0
+            )
 
             # A trim that costs more in tax than the risk it removes is not
             # obviously correct. Surface it as a deferred decision rather than
             # either forcing it through or silently skipping it.
             if tax_cost > amount * 0.25 and account.tax_treatment == "taxable":
+                # An assumed rate is disclosed here specifically because this
+                # branch withholds a trade. A 22%-bracket client whose policy
+                # records no rate would otherwise see a concentration fix
+                # declined on the strength of a number nobody chose.
+                rate_caveat = (
+                    ""
+                    if rates_on_file
+                    else (
+                        " No marginal tax rate is recorded on this client's investment "
+                        "policy, so top-bracket rates (37% short-term, 20% long-term) were "
+                        "assumed; recording the client's actual rates may allow this trim."
+                    )
+                )
                 plan.deferred.append(
                     {
                         "symbol": holding.symbol,
@@ -283,8 +314,10 @@ def plan_rebalance(
                             f"${tax_cost:,.0f} of tax -- more than 25% of the trade. The "
                             f"{breach['kind']} concentration is left in place for a human "
                             f"to weigh; consider trimming across tax years instead."
+                            + rate_caveat
                         ),
                         "estimated_tax": round(tax_cost, 2),
+                        "tax_rates_assumed": not rates_on_file,
                     }
                 )
                 continue

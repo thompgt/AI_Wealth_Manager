@@ -348,6 +348,11 @@ class PolicyDraft(BaseModel):
     excluded_sectors: Optional[List[str]] = None
     lot_selection_method: Optional[Literal["HIFO", "FIFO", "LIFO"]] = None
     harvest_losses: Optional[bool] = None
+    # The client's own marginal rates. Left unset, tax cost is estimated at
+    # top-bracket rates, which withholds trims a lower-bracket client should
+    # be making -- the plan says so in its notes when that happens.
+    marginal_tax_rate: Optional[float] = Field(default=None, ge=0, le=1)
+    capital_gains_tax_rate: Optional[float] = Field(default=None, ge=0, le=1)
     benchmark_ticker: Optional[str] = None
     rebalance_frequency_days: Optional[int] = Field(default=None, ge=1, le=3650)
     notes: Optional[str] = None
