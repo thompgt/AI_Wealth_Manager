@@ -240,8 +240,9 @@ approval round trip. Agents never call the network directly; everything goes thr
    approved. The checkpointer writes the paused state durably and the HTTP call returns a
    pending-approval response — the process can restart without losing the run.
 9. **`POST /api/v1/runs/{run_id}/approve`** resumes with `Command(resume=approved)` against the
-   same `thread_id`. On completion, `server.py` persists the audit trail to `agent_runs` and
-   the structured payload plus prose to `reports`.
+   same `thread_id`. On completion, `services/run_service.py` persists the audit trail to
+   `agent_runs` and the structured payload plus prose to `reports`, records the surviving
+   recommendations for outcome scoring, and captures a portfolio snapshot.
 
 ### Module responsibilities
 
@@ -252,7 +253,9 @@ approval round trip. Agents never call the network directly; everything goes thr
 | `checkpointer.py` | Selects a durable checkpointer — Postgres if the app points at Postgres, else SQLite, else in-memory with a loud warning. This is what carries a paused run across the resume request. |
 | `config.py` | Pydantic settings plus environment safety validation; refuses to start outside `development` with placeholder keys or SQLite behind multiple workers. |
 | `db.py` | SQLAlchemy models — `client_profiles`, `holdings`, `transaction_logs`, `agent_runs`, `reports`, `market_data_cache`, `approvals` — plus init and dev seed. |
-| `server.py` | FastAPI app: API-key auth, client CRUD, run/approve endpoints, `/health`, and persistence of the audit trail and report after each run. |
+| `server.py` | FastAPI app: tenant-scoped auth, client CRUD, run/approve endpoints, `/health`, `/metrics`. It enqueues work rather than executing it inline. |
+| `services/jobs.py` | Durable job queue: a `jobs` table plus a worker thread pool. Claiming is a conditional `UPDATE` so two workers cannot take the same row, and a worker that dies mid-run stops heartbeating and has its job reclaimed. No Redis, no Celery. |
+| `services/run_service.py` | The seam between the graph and the database: persists the audit trail per node (deduplicated, so a resumed run does not double-write), stores rejected reports marked rejected, records recommendations for outcome scoring, and captures a portfolio snapshot at the end of each run. Executes no trades. |
 | `app.py` | Solara dashboard. Holds no business logic — it is an HTTP client of `server.py`, including the approval round trip. |
 | `agents/diagnostics.py` | Valuation, concentration, sector exposure, Sharpe/return/volatility via PyPortfolioOpt, scored against the client's risk tier. |
 | `agents/market_regime.py` | Deterministic macro trend signals, then LLM classification grounded in them. Fail-safe to `Volatile`/0.0. |
@@ -343,7 +346,10 @@ All endpoints except `/health` require an `X-API-Key` header.
 | `POST` | `/api/v1/clients` | Create a client with holdings |
 | `GET` | `/api/v1/clients` · `/api/v1/clients/{id}` | List / fetch |
 | `PUT` | `/api/v1/clients/{id}` | Update |
-| `POST` | `/api/v1/clients/{id}/run` | Run the graph; returns results or a pending approval |
+| `POST` | `/api/v1/clients/{id}/runs` | Enqueue a graph run; returns `202` with a job id |
+| `GET` | `/api/v1/jobs` · `/api/v1/jobs/{job_id}` | Poll queued/running work and its progress |
+| `DELETE` | `/api/v1/jobs/{job_id}` | Request cancellation of a queued or running job |
+| `GET` | `/api/v1/runs/{run_id}` | Run status, including a pending approval |
 | `POST` | `/api/v1/runs/{run_id}/approve` | Resume a paused run |
 | `GET` | `/api/v1/clients/{id}/reports` · `/api/v1/reports/{id}` | Reports |
 
