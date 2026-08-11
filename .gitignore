@@ -4,6 +4,11 @@ __pycache__/
 *.egg-info/
 .env
 *.db
+# WAL and shared-memory sidecars. `*.db` alone does not cover these, so a
+# multi-megabyte -wal sat untracked next to an ignored database, one
+# `git add .` from being committed.
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
