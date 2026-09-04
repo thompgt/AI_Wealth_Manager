@@ -85,3 +85,39 @@ def reset_checkpointer() -> None:
     """Used by tests to force a fresh checkpointer against a temp database."""
     global _checkpointer
     _checkpointer = None
+
+
+def is_durable() -> bool:
+    """True when the active checkpointer survives a process restart.
+
+    The MemorySaver fallback logs an error when it is chosen, and a logged
+    error in a deployment is something nobody reads until the incident. This
+    turns the same fact into a value a readiness probe can fail on, because a
+    replica whose paused approvals evaporate on the next deploy should not be
+    taking traffic -- it will accept runs, pause them at the approval gate,
+    and lose them.
+    """
+    saver = get_checkpointer()
+    return type(saver).__name__ != "MemorySaver"
+
+
+def probe() -> bool:
+    """Can the checkpoint store actually be read right now?
+
+    Constructing the saver is not proof it works: the SQLite file can be
+    deleted or its volume unmounted, and a Postgres saver holds a connection
+    that can be severed, both long after `setup()` succeeded. This performs a
+    real read against the store.
+    """
+    try:
+        saver = get_checkpointer()
+        if type(saver).__name__ == "MemorySaver":
+            return False
+        # A thread id that will never exist. The point is to exercise the
+        # store's read path and its connection, not to find a checkpoint --
+        # an empty result is a healthy answer.
+        saver.get_tuple({"configurable": {"thread_id": "__readiness_probe__"}})
+        return True
+    except Exception:  # noqa: BLE001 -- a probe reports, it does not raise
+        logger.exception("Checkpointer readiness probe failed")
+        return False
