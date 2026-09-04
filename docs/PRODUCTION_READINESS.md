@@ -13,8 +13,8 @@ each lands.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | Container images and a compose stack that runs api + worker + Postgres | todo |
-| 2 | Split liveness from readiness; readiness checks deps and schema version | todo |
+| 1 | Container images and a compose stack that runs api + worker + Postgres | done |
+| 2 | Split liveness from readiness; readiness checks deps and schema version | done |
 | 3 | Request correlation ids threaded through logs and responses | todo |
 | 4 | One error model (RFC 9457) across every endpoint, leaking nothing | todo |
 | 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | todo |
@@ -31,6 +31,7 @@ each lands.
 | 16 | Operations runbook: deploy, rollback, restore, incident triage | todo |
 | 17 | Threat model, security policy, licence | todo |
 | 18 | README rewritten against the architecture that exists today | todo |
+| 19 | Reconnect the dashboard: it does not import, and calls a removed endpoint | todo |
 
 ## Why these, and not features
 
@@ -61,3 +62,18 @@ capability it lacks:
   accounts. The code has orgs, JWT sessions, four roles, accounts, tax lots,
   orders and a rebalance agent. A README that misdescribes the auth model is a
   production hazard, not a documentation nit.
+* **19** — found while writing the compose file, not from the backlog: `app.py`
+  reads `settings.API_AUTH_KEY`, which the auth rework deleted, so the dashboard
+  raises `AttributeError` on import and never starts. It also posts to
+  `/clients/{id}/run`, which became `/clients/{id}/runs` returning 202 and a job
+  id to poll. The only client-facing surface in the system has been dead since
+  the auth rework, and nothing caught it because nothing imports `app.py` in a
+  test.
+
+## Found along the way
+
+Items added because the work surfaced them, rather than from the initial
+review. Recorded here rather than folded silently into another item, since what
+a review *missed* is worth as much as what it found:
+
+* **19** — the dashboard does not start. A README screenshot is not a test.
