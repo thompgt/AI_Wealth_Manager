@@ -13,24 +13,24 @@ each lands.
 
 | # | Item | Status |
 |---|---|---|
-| 1 | Container images and a compose stack that runs api + worker + Postgres | done |
-| 2 | Split liveness from readiness; readiness checks deps and schema version | done |
-| 3 | Request correlation ids threaded through logs and responses | done |
-| 4 | One error model (RFC 9457) across every endpoint, leaking nothing | done |
-| 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | done |
-| 6 | Wall-clock budgets per node and per run | done |
-| 7 | Per-org LLM spend cap enforced at call time | done |
-| 8 | Postgres engine hardening: pooling, timeouts, pre-ping | done |
-| 9 | Field-level encryption for client PII at rest | done |
-| 10 | Client data export and retention-aware purge | done |
-| 11 | API key rotation and lifecycle visibility | done |
-| 12 | Prompt-injection red-team and golden-fixture agent evals | done |
-| 13 | CI: Postgres migrations, dependency audit, coverage floor | done |
-| 14 | Alert rules for the failure modes that return HTTP 200 | done |
-| 15 | Load and soak harness, with capacity numbers written down | done |
-| 16 | Operations runbook: deploy, rollback, restore, incident triage | done |
-| 17 | Threat model, security policy, licence | done |
-| 18 | README rewritten against the architecture that exists today | done |
+| 1 | Container images and a compose stack that runs api + worker + Postgres | todo |
+| 2 | Split liveness from readiness; readiness checks deps and schema version | todo |
+| 3 | Request correlation ids threaded through logs and responses | todo |
+| 4 | One error model (RFC 9457) across every endpoint, leaking nothing | todo |
+| 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | todo |
+| 6 | Wall-clock budgets per node and per run | todo |
+| 7 | Per-org LLM spend cap enforced at call time | todo |
+| 8 | Postgres engine hardening: pooling, timeouts, pre-ping | todo |
+| 9 | Field-level encryption for client PII at rest | todo |
+| 10 | Client data export and retention-aware purge | todo |
+| 11 | API key rotation and lifecycle visibility | todo |
+| 12 | Prompt-injection red-team and golden-fixture agent evals | todo |
+| 13 | CI: Postgres migrations, dependency audit, coverage floor | todo |
+| 14 | Alert rules for the failure modes that return HTTP 200 | todo |
+| 15 | Load and soak harness, with capacity numbers written down | todo |
+| 16 | Operations runbook: deploy, rollback, restore, incident triage | todo |
+| 17 | Threat model, security policy, licence | todo |
+| 18 | README rewritten against the architecture that exists today | todo |
 
 ## Why these, and not features
 
