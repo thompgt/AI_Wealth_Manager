@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from config import settings
 from db import Job, SessionLocal, utcnow
-from logging_setup import get_logger, log_context
+from logging_setup import current_context, get_logger, log_context
 from metrics import job_queue_depth, job_wait_seconds, jobs_enqueued, jobs_finished
 
 logger = get_logger(__name__)
@@ -72,6 +72,7 @@ def enqueue(
     priority: int = 100,
     max_attempts: int = 1,
     dedupe: bool = True,
+    correlation_id: Optional[str] = None,
 ) -> Job:
     """Queue a job. Caller commits.
 
@@ -81,6 +82,16 @@ def enqueue(
     intended position -- the failure is silent and expensive, so the default
     is to refuse.
     """
+    # The request that queues a run and the worker that executes it are
+    # different processes, minutes apart. Without carrying the id across, a
+    # client reporting "my analysis failed" gives an operator a request id
+    # that matches four log lines and stops at the 202 -- every line
+    # describing the actual failure sits under a different id, in a different
+    # process, and the two halves of one incident cannot be joined by a
+    # search. Defaulting to the ambient context means callers do not have to
+    # remember.
+    correlation_id = correlation_id or current_context().get("request_id")
+
     if dedupe and client_id is not None:
         existing = (
             db.query(Job)
@@ -105,7 +116,8 @@ def enqueue(
         job_type=job_type,
         status="queued",
         priority=priority,
-        payload=payload or {},
+        payload={**(payload or {}), "correlation_id": correlation_id} if correlation_id
+        else (payload or {}),
         max_attempts=max_attempts,
         requested_by_user_id=requested_by_user_id,
     )
@@ -319,7 +331,14 @@ class JobWorker:
         handler = _HANDLERS.get(job.job_type)
         started = time.monotonic()
 
-        with log_context(job_id=job.job_id, client_id=job.client_id, run_id=job.run_id):
+        # request_id is rebound from the payload so every line this job emits
+        # carries the id of the request that asked for it, however long ago.
+        with log_context(
+            job_id=job.job_id,
+            client_id=job.client_id,
+            run_id=job.run_id,
+            request_id=(job.payload or {}).get("correlation_id"),
+        ):
             if handler is None:
                 job.status = "failed"
                 job.error = f"No handler registered for job type {job.job_type!r}."

@@ -23,6 +23,7 @@ from itertools import islice
 from typing import Dict, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
@@ -90,6 +91,12 @@ _shutting_down = threading.Event()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    # Cleared on the way up as well as set on the way down. The flag is
+    # module state, so a process whose lifespan runs twice -- a test client
+    # reused, an embedded app restarted -- would otherwise come up already
+    # draining and fail readiness forever, with nothing in the logs to say
+    # why.
+    _shutting_down.clear()
 
     problems = settings.validate_for_environment()
     if problems:
@@ -161,6 +168,12 @@ async def observability_middleware(request: Request, call_next):
     import uuid
 
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())[:8]
+    # Exception handlers run outside this middleware's `with log_context`
+    # block, so the bound context is gone by the time one of them formats a
+    # body. Stashing it on the request is what lets an error carry the same id
+    # the logs for that request carry -- without which "quote the id in the
+    # error" gives support an id that appears nowhere in the logs.
+    request.state.request_id = request_id
     started = time.perf_counter()
 
     with log_context(request_id=request_id):
@@ -423,6 +436,117 @@ def _get_client(db: Session, client_id: int, principal: Principal) -> ClientProf
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found.")
     return client
+
+
+# --- Errors ------------------------------------------------------------------
+#
+# One shape for every failure, and one place that decides what a client is
+# allowed to learn from one.
+#
+# Before this, an error's body depended on which layer produced it: FastAPI's
+# `{"detail": ...}` for a raised HTTPException, a different `{"detail": [...]}`
+# for a validation failure, and for an unhandled exception whatever Starlette's
+# default 500 emits -- with no request id in any of them, so an operator handed
+# "it failed at 14:03" had nothing to search on.
+#
+# The format is RFC 9457 problem details, because it is the one HTTP has, and
+# `application/problem+json` tells a client the body is an error without
+# inspecting the status code.
+
+PROBLEM_MEDIA_TYPE = "application/problem+json"
+
+# Status -> a stable, non-leaking title. The title is safe to show a client and
+# safe to alert on; the detail may be more specific. Deliberately not
+# `HTTPStatus(code).phrase` for everything: "Unprocessable Entity" tells a user
+# nothing they can act on.
+_PROBLEM_TITLES = {
+    400: "The request could not be understood.",
+    401: "Authentication is required.",
+    403: "This action is not permitted for your role.",
+    404: "Not found.",
+    409: "This conflicts with the current state.",
+    422: "The request failed validation.",
+    429: "Rate limit exceeded.",
+    500: "The service could not complete this request.",
+    503: "The service is temporarily unavailable.",
+}
+
+
+def _problem(
+    request: Request,
+    status_code: int,
+    detail: object,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", None)
+    body: Dict[str, object] = {
+        # A URI reference identifying the *kind* of problem. Relative and
+        # stable, so a client can branch on it without parsing prose that a
+        # copy edit could change under them.
+        "type": f"/problems/{status_code}",
+        "title": _PROBLEM_TITLES.get(status_code, "Request failed."),
+        "status": status_code,
+        "instance": request.url.path,
+    }
+    if detail is not None:
+        body["detail"] = detail
+    if request_id:
+        # The single most useful field in the body. It is the same id in the
+        # response header, in every log line for this request, and -- for a
+        # queued run -- in the worker's lines minutes later.
+        body["request_id"] = request_id
+    response = JSONResponse(body, status_code=status_code, media_type=PROBLEM_MEDIA_TYPE)
+    for key, value in (headers or {}).items():
+        response.headers[key] = value
+    if request_id:
+        response.headers["X-Request-ID"] = request_id
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def handle_http_exception(request: Request, exc: HTTPException):
+    return _problem(request, exc.status_code, exc.detail, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError):
+    """422s, with the input echo removed.
+
+    FastAPI's default body includes an `input` key repeating the offending
+    value. For this API those values are a client's date of birth, net worth
+    and holdings, and echoing them puts client data into error logs, browser
+    consoles and any monitoring tool that samples response bodies.
+    """
+    errors = [
+        {
+            "field": ".".join(str(part) for part in error.get("loc", [])[1:]),
+            "message": error.get("msg"),
+            "type": error.get("type"),
+        }
+        for error in exc.errors()
+    ]
+    return _problem(request, status.HTTP_422_UNPROCESSABLE_ENTITY, errors)
+
+
+@app.exception_handler(Exception)
+async def handle_unexpected_error(request: Request, exc: Exception):
+    """The catch-all, and the one that must say the least.
+
+    An unhandled exception's message is written for a developer and routinely
+    contains a SQL fragment, a file path or a provider's response. None of
+    that is a client's business, and a stack trace in a response body is a map
+    of the application. The client gets a request id; the log gets everything.
+    """
+    logger.exception(
+        "Unhandled error serving %s %s", request.method, request.url.path
+    )
+    metrics.unhandled_errors.labels(request.url.path).inc()
+    return _problem(
+        request,
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "An unexpected error occurred. Quote the request id when reporting this.",
+    )
 
 
 # --- Health and metrics ------------------------------------------------------
@@ -1687,21 +1811,3 @@ def list_audit_events(
         for e in events
     ]
 
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    """Log the detail, return none of it.
-
-    A stack trace in an API response tells an attacker the framework, the file
-    layout and often the query. The request id is echoed so a user can quote
-    it and an operator can find the corresponding log line.
-    """
-    request_id = getattr(request.state, "request_id", None)
-    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "detail": "An internal error occurred.",
-            "request_id": request_id,
-        },
-    )

@@ -42,6 +42,17 @@ http_latency = Histogram(
     registry=REGISTRY,
 )
 
+# Separate from the 5xx count in http_requests_total on purpose. A 503 from a
+# readiness probe during a deploy and an unhandled exception in a request path
+# are both "5xx", and only one of them is a bug. Alerting on the mixed series
+# means either paging on every rollout or not paging on a real fault.
+unhandled_errors = Counter(
+    "unhandled_errors_total",
+    "Requests that reached the catch-all exception handler.",
+    ["path"],
+    registry=REGISTRY,
+)
+
 # --- Graph runs --------------------------------------------------------------
 
 runs_started = Counter("analysis_runs_started_total", "Analysis runs started.", registry=REGISTRY)
