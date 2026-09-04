@@ -1,0 +1,134 @@
+# The full stack: Postgres, the API, a separate job worker, and the dashboard.
+#
+# This is the deployment shape the system is written for, and running it
+# locally is the only way to exercise the parts that SQLite hides -- the
+# Postgres checkpointer, two processes contending for the same job table, and
+# a schema that must be migrated rather than created from the models.
+#
+#   cp .env.example .env      # then set POSTGRES_PASSWORD and a JWT_SECRET
+#   docker compose up --build
+#
+# ENVIRONMENT defaults to production in the image, which means the startup
+# safety checks are live: the stack refuses to boot with a placeholder
+# JWT_SECRET or bootstrap password. That is deliberate. A compose file that
+# quietly runs in development mode teaches the wrong defaults and is the one
+# people copy into a real deployment.
+
+name: ai-wealth-manager
+
+x-app-env: &app-env
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  NEON_DATABASE_URL: postgresql://wealth:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/wealth
+  JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env -- generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`}
+  BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:?set BOOTSTRAP_ADMIN_EMAIL in .env}
+  BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?set BOOTSTRAP_ADMIN_PASSWORD in .env}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
+  CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8765}
+  # Postgres backs the checkpointer when the app points at Postgres, so this
+  # path is unused here. Kept pointing at the volume so a misconfiguration
+  # writes somewhere durable rather than into the container layer.
+  CHECKPOINT_DB_PATH: /app/data/checkpoints.sqlite
+  LOG_FORMAT: json
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: wealth
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: wealth
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` alone returns success while the server is still in its
+      # initdb phase and about to restart, so dependents start, fail to
+      # connect, and crash-loop. Naming the user and database makes it a real
+      # connection test.
+      test: ["CMD-SHELL", "pg_isready -U wealth -d wealth"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    # Not published. Nothing outside this network needs the database, and a
+    # published 5432 on a developer's machine is a database on their LAN.
+    expose:
+      - "5432"
+
+  # Migrations run once, in their own container, before either process that
+  # would use the new schema. Running them from an application entrypoint
+  # instead means N replicas racing the same DDL on every deploy, and the
+  # schema check in /ready has nothing to be checked against.
+  migrate:
+    build: .
+    environment:
+      <<: *app-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    environment:
+      <<: *app-env
+      # The API serves requests; the worker runs graphs. Sharing a process
+      # means a burst of analysis runs adds latency to every unrelated call.
+      JOB_WORKER_ENABLED: "false"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - appdata:/app/data
+    restart: unless-stopped
+
+  worker:
+    build: .
+    environment:
+      <<: *app-env
+      JOB_WORKER_ENABLED: "true"
+    command: ["python", "worker.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - appdata:/app/data
+    # Longer than WORKER_SHUTDOWN_GRACE_SECONDS (25s) so the drain finishes
+    # before Docker escalates to SIGKILL. Getting this the wrong way round is
+    # how a graceful shutdown silently becomes an abrupt one.
+    stop_grace_period: 40s
+    restart: unless-stopped
+    healthcheck:
+      # The worker serves no HTTP. What it must not be is a process that is
+      # alive but no longer claiming work, so the check asks the database
+      # whether this worker has heartbeated recently.
+      test: ["CMD", "python", "worker_health.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  dashboard:
+    build: .
+    environment:
+      <<: *app-env
+      JOB_WORKER_ENABLED: "false"
+      # The dashboard is an HTTP client of the API and holds no business
+      # logic, so it needs the API's address and a key, not the database.
+      WEALTH_API_URL: http://api:8000
+    command: ["solara", "run", "app.py", "--host", "0.0.0.0", "--port", "8765"]
+    ports:
+      - "8765:8765"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  appdata:
