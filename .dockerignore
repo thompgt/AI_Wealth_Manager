@@ -1,0 +1,44 @@
+# The build context is copied into the daemon before the first instruction
+# runs, so anything listed here is a byte that never crosses the wire and a
+# layer that never invalidates. Two of these matter beyond speed:
+#
+#   .env       -- real credentials. Copied into an image, they are readable by
+#                 anyone who can pull it, and they survive being "deleted" in a
+#                 later layer. Secrets come from the runtime environment.
+#   *.db       -- a local SQLite file holds real client rows. Baking one into a
+#                 published image discloses them.
+
+.git
+.gitignore
+.github
+
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+.env
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+
+# The notebook is committed with its outputs so it reads without running; the
+# service never opens it, and its dependency set (a Jupyter kernel, a static
+# image exporter) is deliberately not installed in the image.
+demo.ipynb
+requirements-notebook.txt
+docs/
+*.md
+!README.md
+
+.claude/
+.idea/
+.vscode/
