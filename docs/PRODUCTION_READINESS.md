@@ -15,7 +15,7 @@ each lands.
 |---|---|---|
 | 1 | Container images and a compose stack that runs api + worker + Postgres | done |
 | 2 | Split liveness from readiness; readiness checks deps and schema version | done |
-| 3 | Request correlation ids threaded through logs and responses | todo |
+| 3 | Correlation ids that survive the request/job boundary | todo |
 | 4 | One error model (RFC 9457) across every endpoint, leaking nothing | todo |
 | 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | todo |
 | 6 | Wall-clock budgets per node and per run | todo |
@@ -31,7 +31,7 @@ each lands.
 | 16 | Operations runbook: deploy, rollback, restore, incident triage | todo |
 | 17 | Threat model, security policy, licence | todo |
 | 18 | README rewritten against the architecture that exists today | todo |
-| 19 | Reconnect the dashboard: it does not import, and calls a removed endpoint | todo |
+| 19 | Reconnect the dashboard: it does not import, and calls a removed endpoint | done |
 
 ## Why these, and not features
 
