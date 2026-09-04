@@ -19,8 +19,8 @@ each lands.
 | 4 | One error model (RFC 9457) across every endpoint, leaking nothing | todo |
 | 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | todo |
 | 6 | Wall-clock budgets per node and per run | todo |
-| 7 | Per-org LLM spend cap enforced at call time | todo |
-| 8 | Postgres engine hardening: pooling, timeouts, pre-ping | todo |
+| 7 | Per-org daily LLM spend cap (a per-run one already exists) | todo |
+| 8 | Postgres statement/lock timeouts and startup connect retry | todo |
 | 9 | Field-level encryption for client PII at rest | todo |
 | 10 | Client data export and retention-aware purge | todo |
 | 11 | API key rotation and lifecycle visibility | todo |
@@ -44,10 +44,11 @@ capability it lacks:
   200 with plausible output. Nothing in the HTTP surface distinguishes that from
   a healthy run, and nothing pages.
 * **5, 6, 7** — the current failure modes are unbounded: a hung provider pins a
-  worker forever, a deploy strands running jobs, and a runaway retry loop bills
-  the operator with no ceiling.
-* **8** — SQLite is refused outside development, but the Postgres path has never
-  been given a pool size, a statement timeout or a liveness check.
+  worker forever, a deploy strands running jobs, and while a single run's LLM
+  spend is capped, nothing caps the number of runs an org may start in a day.
+* **8** — the Postgres path is pooled and pre-pinged, but a query with no
+  statement timeout blocks a connection until someone notices, and a boot that
+  races the database coming up fails permanently instead of retrying.
 * **9, 10, 11, 17** — this stores names, emails, dates of birth, net worth and
   holdings. Plaintext at rest, no export, no purge and no written threat model
   is the wrong posture for that data regardless of scale.
