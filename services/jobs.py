@@ -245,18 +245,37 @@ class JobWorker:
             self._threads.append(thread)
         logger.info("Started %d job worker thread(s) as %s", self.worker_count, WORKER_ID)
 
-    def stop(self, timeout: float = 10.0) -> None:
-        """Signal the workers to stop and wait briefly for in-flight jobs.
+    def stop(self, timeout: Optional[float] = None) -> None:
+        """Signal the workers to stop and wait for in-flight jobs.
 
         Daemon threads mean the process can still exit if a job overruns, but
         the wait gives an in-flight run a chance to finish and commit rather
         than being reclaimed as stale by the next deploy.
+
+        The budget is for the *pool*, not per thread. Joining each thread with
+        the full timeout meant N threads could take N x timeout to drain, so a
+        two-thread worker with a 25s budget could overrun a 30s grace period
+        and be killed anyway -- turning a deliberate drain into the abrupt
+        termination it was meant to replace.
         """
+        budget = timeout if timeout is not None else settings.WORKER_SHUTDOWN_GRACE_SECONDS
         self._stop.set()
+        deadline = time.monotonic() + budget
         for thread in self._threads:
-            thread.join(timeout=timeout)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        still_running = [t.name for t in self._threads if t.is_alive()]
         self._threads.clear()
-        logger.info("Job workers stopped.")
+        if still_running:
+            # Named, because the next thing that happens is a SIGKILL and
+            # these jobs will reappear as stale reclaims minutes later. The
+            # log line is what connects the two events.
+            logger.warning(
+                "Job worker(s) %s still running after %.0fs; their jobs will be "
+                "reclaimed by another worker once the heartbeat goes stale.",
+                ", ".join(still_running), budget,
+            )
+        else:
+            logger.info("Job workers stopped cleanly.")
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -383,10 +402,17 @@ def start_worker() -> Optional[JobWorker]:
     return _worker
 
 
-def stop_worker() -> None:
+def stop_worker(timeout: Optional[float] = None) -> None:
+    """Stop the in-process worker, waiting `timeout` for in-flight jobs.
+
+    The default comes from settings rather than the 10s literal that used to
+    be hardcoded in `JobWorker.stop`, because the right value is a property of
+    the deployment's termination grace period, not of this module.
+    """
     global _worker
     if _worker is not None:
-        _worker.stop()
+        _worker.stop(timeout=timeout if timeout is not None
+                     else settings.WORKER_SHUTDOWN_GRACE_SECONDS)
         _worker = None
 
 

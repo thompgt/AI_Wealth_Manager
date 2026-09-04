@@ -157,6 +157,14 @@ class Settings(BaseSettings):
     # Set false on API-only replicas so a dedicated worker process owns
     # execution.
     JOB_WORKER_ENABLED: bool = True
+    # How long a draining worker waits for in-flight jobs after SIGTERM.
+    # Must be *less* than the orchestrator's termination grace period
+    # (Kubernetes: terminationGracePeriodSeconds, 30s by default; Compose:
+    # stop_grace_period) -- overrunning it earns a SIGKILL, which abandons the
+    # job mid-run and is the outcome draining exists to avoid. A run that
+    # cannot finish inside the window is better reclaimed by another worker
+    # than half-committed by this one.
+    WORKER_SHUTDOWN_GRACE_SECONDS: float = 25.0
 
     # --- Trading -------------------------------------------------------------
     # Master switch. Orders are simulated regardless of this flag -- there is
