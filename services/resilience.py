@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional, Tuple, Type, TypeVar
 
 from logging_setup import get_logger
+from services import deadline
 
 logger = get_logger(__name__)
 
@@ -100,6 +101,12 @@ def retry_call(
     retry_types = tuple(retry_on) if retry_on else (Exception,)
     last: Optional[BaseException] = None
 
+    # Checked before the first attempt as well as between them. A run that is
+    # already out of time should not open a new connection at all -- and the
+    # first attempt is where most of the time goes, so checking only between
+    # retries would let one final call overrun the budget by a full timeout.
+    deadline.check(label)
+
     for attempt in range(1, max(1, attempts) + 1):
         try:
             return fn()
@@ -109,6 +116,14 @@ def retry_call(
                 break
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
             delay *= 0.5 + random.random()  # noqa: S311 -- jitter, not crypto
+            if deadline.expired():
+                # Retrying is the most expensive thing this function can do,
+                # and a retry that starts after the run is over cannot help
+                # the run. Fail with the underlying error rather than the
+                # deadline: the caller's fallback path is keyed to *why* the
+                # provider failed, and "out of time" would lose that.
+                logger.debug("%s: out of run time; not retrying.", label)
+                break
             logger.debug(
                 "%s failed (attempt %d/%d): %s; retrying in %.2fs",
                 label, attempt, attempts, exc, delay,

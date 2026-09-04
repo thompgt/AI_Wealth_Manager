@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional, TypeVar
 
 from config import settings
+from services import deadline
+from services.deadline import DeadlineExceeded
 from logging_setup import get_logger
 from metrics import (
     llm_budget_headroom,
@@ -115,6 +117,11 @@ def classify_failure(exc: BaseException) -> str:
         return "no_api_key"
     if isinstance(exc, BudgetExceeded):
         return "budget_exceeded"
+    if isinstance(exc, DeadlineExceeded):
+        # A distinct reason rather than folding into "timeout": a timeout
+        # means the model did not answer in time, this means the run never
+        # asked. An operator tuning the deadline needs to tell those apart.
+        return "run_deadline"
     text = f"{type(exc).__name__}: {exc}".lower()
     if any(m in text for m in ("api key not valid", "api_key_invalid", "unauthorized")):
         return "invalid_api_key"
@@ -312,6 +319,12 @@ def invoke_with_retry(call: Callable[[], T], *, what: str = "LLM call") -> T:
                 )
                 raise
             delay = settings.LLM_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            if deadline.expired():
+                logger.warning(
+                    "%s failed on attempt %d/%d and the run is out of time; "
+                    "not retrying.", what, attempt, attempts,
+                )
+                raise
             logger.warning(
                 "%s failed with a transient error on attempt %d/%d (%s); retrying in %.1fs",
                 what, attempt, attempts, exc, delay,
@@ -340,6 +353,13 @@ def invoke_tracked(
         # Checked before the call, not after: a budget that only stops
         # spending once it has already been exceeded is a report, not a limit.
         budget.check()
+
+    # Same reasoning for time as for money. An LLM call is the single most
+    # expensive thing a node does in wall-clock terms -- a 60s timeout times
+    # three attempts with backoff between them -- so a run already past its
+    # deadline must not start one. The agent's fallback is deterministic and
+    # instant, which is exactly what a run out of time should produce.
+    deadline.check(f"{node} LLM call")
 
     try:
         with timed(llm_latency, node=node):

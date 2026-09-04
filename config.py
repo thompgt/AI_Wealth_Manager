@@ -154,6 +154,13 @@ class Settings(BaseSettings):
     # A job that a worker claimed but never finished (process killed mid-run)
     # is reclaimed after this long without a heartbeat.
     JOB_HEARTBEAT_STALE_SECONDS: int = 120
+    # Wall-clock ceiling on one graph run, enforced by refusing to *start* new
+    # outbound calls once it passes. Deliberately well under
+    # JOB_TIMEOUT_SECONDS: the job timeout is a backstop that fails the row
+    # outright, while this one lets the run finish early and return the
+    # partial analysis it has, with the shortfall stated. If they were equal
+    # the gentle path would never win the race.
+    RUN_DEADLINE_SECONDS: int = 600
     # Set false on API-only replicas so a dedicated worker process owns
     # execution.
     JOB_WORKER_ENABLED: bool = True

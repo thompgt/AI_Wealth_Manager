@@ -45,6 +45,7 @@ from db import ClientProfile as ClientProfileModel
 from db import SessionLocal, utcnow
 from logging_setup import get_logger, log_context
 from metrics import approvals_requested, guardrail_blocks, runs_started
+from services.deadline import run_deadline
 from services.llm import run_budget
 from services.market_data import quote_provenance
 from services.policy import resolve as resolve_policy
@@ -521,7 +522,15 @@ def run_client_graph(client_id: int, run_id: Optional[str] = None) -> dict:
     # LangGraph checkpoints its state and a budget holds a lock, which is not
     # serializable. A resumed run gets a fresh budget, which is correct --
     # the earlier spend already happened and is already recorded.
-    with log_context(run_id=resolved_run_id, client_id=client_id), run_budget():
+    # Time and money are bounded the same way and for the same reason: a run
+    # that misbehaves should cost a known maximum of each. The deadline is
+    # bound here rather than inside the graph so it covers state loading and
+    # every node, which is where the many small market-data calls live.
+    with (
+        log_context(run_id=resolved_run_id, client_id=client_id),
+        run_budget(),
+        run_deadline(),
+    ):
         logger.info("Starting analysis run for client %s", client_id)
         result = get_workflow().invoke(initial_state, config=config)
 
@@ -531,7 +540,10 @@ def run_client_graph(client_id: int, run_id: Optional[str] = None) -> dict:
 def resume_client_graph(run_id: str, approved: bool, note: Optional[str] = None) -> dict:
     """Resume a run paused at the approval gate."""
     config = {"configurable": {"thread_id": run_id}}
-    with log_context(run_id=run_id), run_budget():
+    # A resumed run gets a fresh deadline, matching how it gets a fresh spend
+    # budget: the pause is a human's, and holding a client's approval against
+    # the run's clock would fail every run that waited overnight for review.
+    with log_context(run_id=run_id), run_budget(), run_deadline():
         logger.info("Resuming run with approved=%s", approved)
         result = get_workflow().invoke(
             Command(resume={"approved": approved, "note": note}), config=config
