@@ -193,10 +193,45 @@ def create_client(
     return _request(session, "POST", "/api/v1/clients", json=payload, client=client)
 
 
+def get_client(
+    session: Session, client_id: int, *, client: Optional[httpx.Client] = None
+) -> Dict[str, Any]:
+    return _request(session, "GET", f"/api/v1/clients/{client_id}", client=client)
+
+
 def get_portfolio(
     session: Session, client_id: int, *, client: Optional[httpx.Client] = None
 ) -> Dict[str, Any]:
     return _request(session, "GET", f"/api/v1/clients/{client_id}/portfolio", client=client)
+
+
+# --- Risk ---------------------------------------------------------------------
+
+
+def get_questionnaire(session: Session, *, client: Optional[httpx.Client] = None) -> Dict[str, Any]:
+    """The server's questionnaire: its questions, scoring dimensions and version.
+
+    Fetched rather than restated in the UI. The tier a client is assigned
+    drives every position cap and beta ceiling downstream, and it must trace
+    to a dated, versioned set of answers on the client's file -- a second copy
+    of the questions in the dashboard is a second scoring system that drifts
+    from the one an examiner would be shown.
+    """
+    return _request(session, "GET", "/api/v1/questionnaire", client=client)
+
+
+def submit_risk_assessment(
+    session: Session,
+    client_id: int,
+    answers: Dict[str, str],
+    *,
+    client: Optional[httpx.Client] = None,
+) -> Dict[str, Any]:
+    """Score answers and set the client's tier, server side."""
+    return _request(
+        session, "POST", f"/api/v1/clients/{client_id}/risk-assessment",
+        json={"answers": answers}, client=client,
+    )
 
 
 # --- Runs --------------------------------------------------------------------
