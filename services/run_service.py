@@ -231,6 +231,13 @@ def persist_report(
         "market_regime": state.get("market_regime"),
         "suitability_result": state.get("suitability_result"),
         "tax_assessment": state.get("tax_assessment"),
+        # What the guardrail gate withheld, and why. This was computed on
+        # every run and then dropped at the persistence boundary, so the
+        # stored report -- the artifact a client reads, and the one an
+        # examiner asks for -- recorded the recommendations that survived and
+        # no trace of the ones a control removed. A report that shows only the
+        # survivors is indistinguishable from a run where nothing was blocked.
+        "tax_blocked_recommendations": state.get("tax_blocked_recommendations") or [],
         "rebalance_plan": state.get("rebalance_plan"),
         "degradations": state.get("degradations"),
         "policy": state.get("policy"),

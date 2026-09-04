@@ -282,3 +282,49 @@ def test_a_wash_sale_flag_removes_the_ticker_from_the_final_recommendations(
         assert "What Was Withheld" in report
     finally:
         orchestrator.reset_workflow()
+
+
+def test_the_stored_report_records_what_was_withheld(monkeypatch, tmp_path):
+    """A report showing only the survivors cannot be told apart from a run
+    where nothing was blocked.
+
+    The guardrail gate computes `tax_blocked_recommendations` on every run,
+    and the persistence boundary used to drop it -- so the artifact a client
+    reads, and the one an examiner asks for, held the recommendations that
+    survived and no trace of the ones a control removed.
+    """
+    from db import ClientProfile, Organization, Report, SessionLocal, init_db
+    from services.run_service import persist_report
+
+    init_db()
+    db = SessionLocal()
+    try:
+        org = db.query(Organization).first()
+        if org is None:
+            org = Organization(name="Withheld Test", slug="withheld-test")
+            db.add(org)
+            db.flush()
+        client = ClientProfile(org_id=org.id, name="Withheld Test Client")
+        db.add(client)
+        db.flush()
+
+        state = {
+            "final_report": "A report.",
+            "portfolio_diagnostics": {},
+            "market_regime": {},
+            "suitability_result": {},
+            "tax_assessment": {"wash_sale_flags": ["XOM", "CVX"]},
+            "tax_blocked_recommendations": ["XOM", "CVX"],
+            "human_approved": True,
+        }
+        report = persist_report(db, "run-withheld-1", client, state)
+        db.flush()
+
+        assert report is not None
+        assert report.structured_payload["tax_blocked_recommendations"] == ["XOM", "CVX"]
+
+        stored = db.query(Report).filter(Report.run_id == "run-withheld-1").first()
+        assert stored.structured_payload["tax_blocked_recommendations"] == ["XOM", "CVX"]
+    finally:
+        db.rollback()
+        db.close()
