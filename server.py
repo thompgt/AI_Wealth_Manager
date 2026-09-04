@@ -50,7 +50,9 @@ from db import (
     to_float,
     utcnow,
 )
+from checkpointer import probe as checkpointer_probe
 from logging_setup import configure_logging, get_logger, log_context
+from schema_version import schema_is_current, schema_status
 from security import (
     Principal,
     authenticate,
@@ -75,6 +77,14 @@ from services.providers import provider_health
 from services.risk_profile import apply_hard_overrides, questionnaire_schema, score_answers
 
 logger = get_logger(__name__)
+
+
+# Flipped the moment shutdown begins, so `/ready` starts failing while the
+# process is still answering requests. The gap between "the load balancer
+# stopped sending work" and "the socket closed" is where in-flight jobs get to
+# finish; without the flag those two events are the same instant and every
+# request in flight at that instant is lost.
+_shutting_down = threading.Event()
 
 
 @asynccontextmanager
@@ -113,6 +123,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        _shutting_down.set()
         jobs.stop_worker()
 
 
@@ -446,6 +457,114 @@ def health(db: Session = Depends(get_db)):
     healthy = checks["database"] == "ok" and not open_circuits
     body = {"status": "ok" if healthy else "degraded", "checks": checks}
     return JSONResponse(body, status_code=200 if checks["database"] == "ok" else 503)
+
+
+@app.get("/live")
+def liveness():
+    """Liveness: is this process able to answer at all?
+
+    Deliberately checks nothing else. A liveness probe is wired to a
+    *restart*, so making it depend on the database converts a database blip
+    into a rolling restart of every replica -- each one killed, each one
+    reloading, none of them able to pass the probe that would let it stay up,
+    and the recovery arriving to find no capacity left. Liveness answers "is
+    the interpreter wedged"; readiness answers "should traffic come here".
+
+    The one condition that fails it is a process already shutting down, which
+    is a state a restart is the correct response to.
+    """
+    if _shutting_down.is_set():
+        return JSONResponse({"status": "shutting_down"}, status_code=503)
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness(db: Session = Depends(get_db)):
+    """Readiness: should this replica receive traffic?
+
+    Four questions, and the third is the one that is usually missing.
+
+    * **Database reachable.** Everything is persisted; without it a request
+      fails after doing work rather than before.
+    * **Schema at head.** A replica running new code against a database still
+      on the previous migration answers 200 to every probe and then throws on
+      the first query touching a new column. Failing readiness instead is what
+      makes a rollout abort on its own rather than proceed to the next batch.
+    * **Checkpointer writable.** A paused human-approval run lives there. A
+      replica that cannot write one accepts a run and loses it at the
+      approval gate.
+    * **Not draining.** Set the instant shutdown begins, so the load balancer
+      stops sending work while in-flight jobs finish, rather than at the
+      moment the socket closes.
+
+    Unauthenticated, so it names no versions and no topology -- each check is
+    a bare ok/failed.
+    """
+    if _shutting_down.is_set():
+        return JSONResponse(
+            {"status": "draining", "checks": {"shutdown": "in_progress"}}, status_code=503
+        )
+
+    checks: Dict[str, str] = {}
+
+    try:
+        db.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception:
+        logger.exception("Readiness: database probe failed")
+        checks["database"] = "failed"
+
+    if checks["database"] == "ok":
+        checks["schema"] = "ok" if schema_is_current(db) else "behind"
+    else:
+        checks["schema"] = "unknown"
+
+    checks["checkpointer"] = "ok" if checkpointer_probe() else "failed"
+
+    ready = checks["database"] == "ok" and checks["schema"] == "ok" and         checks["checkpointer"] == "ok"
+    return JSONResponse(
+        {"status": "ready" if ready else "not_ready", "checks": checks},
+        status_code=200 if ready else 503,
+    )
+
+
+@app.get("/api/v1/system/status")
+def system_status(
+    db: Session = Depends(get_db),
+    _principal: Principal = Depends(require("audit:read")),
+):
+    """The detail `/ready` deliberately withholds.
+
+    `/ready` is unauthenticated and therefore answers in bare ok/failed --
+    naming revisions and topology to anyone who can reach the port is how a
+    probe becomes reconnaissance. But the first question of an incident is
+    "which build, against which schema, with which providers", and answering
+    it by shelling into a container is slower and worse. Same facts, behind
+    the same capability that gates the audit log.
+    """
+    from checkpointer import is_durable
+
+    providers = provider_health()
+    return {
+        "environment": settings.ENVIRONMENT,
+        "version": app.version,
+        "schema": schema_status(db),
+        "checkpointer": {
+            "durable": is_durable(),
+            "reachable": checkpointer_probe(),
+        },
+        "worker": {
+            "enabled": settings.JOB_WORKER_ENABLED,
+            "thread_count": settings.JOB_WORKER_COUNT,
+        },
+        "llm": {
+            "configured": settings.llm_configured,
+            "model": settings.GEMINI_MODEL if settings.llm_configured else None,
+        },
+        "trading_enabled": settings.TRADING_ENABLED,
+        "market_data": providers,
+        "draining": _shutting_down.is_set(),
+    }
 
 
 def _metrics_guard():
