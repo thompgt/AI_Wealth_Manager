@@ -392,13 +392,70 @@ def TaxPanel(tax_assessment, tax_blocked=None):
 
 
 @solara.component
+def RebalancePlanPanel(plan):
+    if not plan:
+        return
+    proposals = plan.get("proposals") or []
+    notes = plan.get("notes") or []
+    if not proposals and not notes:
+        return
+
+    gross = plan.get("gross_notional", 0.0) or 0.0
+    net_cash = plan.get("net_cash_delta", 0.0) or 0.0
+    tax_cost = plan.get("estimated_tax_cost", 0.0) or 0.0
+
+    with solara.Card("Proposed trade plan"):
+        with solara.Row():
+            solara.Markdown(f"**Gross notional:** ${gross:,.2f}")
+            solara.Markdown(
+                f"**Net cash delta:** {'+$' if net_cash >= 0 else '-$'}{abs(net_cash):,.2f}"
+            )
+            solara.Markdown(f"**Estimated tax cost:** ${tax_cost:,.2f}")
+
+        if notes:
+            for note in notes:
+                solara.Markdown(f"- *{note}*")
+
+        if proposals:
+            rows = []
+            for p in proposals:
+                rows.append(
+                    {
+                        "Seq": p.get("sequence", 0),
+                        "Side": p.get("side", ""),
+                        "Symbol": p.get("symbol", ""),
+                        "Shares": (
+                            f"{p.get('quantity', 0.0):,.4f}"
+                            if p.get("quantity") is not None
+                            else "-"
+                        ),
+                        "Notional ($)": f"${p.get('notional', 0.0):,.2f}",
+                        "Est. Tax ($)": (
+                            f"${p.get('estimated_tax_cost', 0.0):,.2f}"
+                            if p.get("estimated_tax_cost") is not None
+                            else "$0.00"
+                        ),
+                        "Rationale": p.get("rationale") or p.get("addresses_flaw") or "",
+                    }
+                )
+            solara.DataFrame(pd.DataFrame(rows))
+        else:
+            solara.Markdown("No trades proposed.")
+
+
+@solara.component
 def ResultsView(result, session, on_approve):
     if not result:
         return
 
     if result.get("status") == "pending_approval":
         interrupt = result.get("interrupt") or {}
-        solara.Warning(f"This run is paused for human review: {interrupt.get('reason')}")
+        reason = interrupt.get("reason", "unknown")
+        explanation = interrupt.get("explanation") or reason
+        solara.Warning(f"This run is paused for human review: {explanation}")
+        RebalancePlanPanel(interrupt.get("rebalance_plan"))
+        RecommendationsPanel(interrupt.get("suitability_result"))
+        TaxPanel(interrupt.get("tax_assessment"), interrupt.get("tax_blocked_recommendations"))
         MarketRegimePanel(interrupt.get("market_regime"))
         if session.may_approve:
             with solara.Row():
@@ -432,6 +489,7 @@ def ResultsView(result, session, on_approve):
 
     PortfolioDiagnosticsPanel(result.get("portfolio_diagnostics"))
     MarketRegimePanel(result.get("market_regime"))
+    RebalancePlanPanel(result.get("rebalance_plan"))
     RecommendationsPanel(result.get("suitability_result"))
     TaxPanel(result.get("tax_assessment"), result.get("tax_blocked_recommendations"))
 

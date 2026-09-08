@@ -176,6 +176,10 @@ def test_the_view_model_carries_what_was_withheld():
             "suitability_result": {"adjusted_recommendations": [{"ticker": "VTI"}]},
             "tax_assessment": {"wash_sale_flags": ["XOM", "CVX"]},
             "tax_blocked_recommendations": ["XOM", "CVX"],
+            "rebalance_plan": {
+                "proposals": [{"symbol": "VTI", "side": "BUY", "notional": 10000.0}],
+                "gross_notional": 10000.0,
+            },
         },
     }
     view = api.view_model(report)
@@ -183,6 +187,7 @@ def test_the_view_model_carries_what_was_withheld():
     assert view["final_report"] == "prose"
     assert view["tax_blocked_recommendations"] == ["XOM", "CVX"]
     assert view["portfolio_diagnostics"]["flaws"] == ["45% in one name"]
+    assert view["rebalance_plan"]["gross_notional"] == 10000.0
 
 
 def test_the_view_model_survives_a_report_with_no_payload():
@@ -190,6 +195,7 @@ def test_the_view_model_survives_a_report_with_no_payload():
     view = api.view_model({"id": 1, "report_text": "prose"})
     assert view["final_report"] == "prose"
     assert view["tax_blocked_recommendations"] is None
+    assert view["rebalance_plan"] is None
 
 
 # --- The guard that was missing ----------------------------------------------
@@ -206,3 +212,4 @@ def test_the_dashboard_module_imports():
 
     assert hasattr(app, "Page")
     assert hasattr(app, "Layout")
+    assert hasattr(app, "RebalancePlanPanel")
