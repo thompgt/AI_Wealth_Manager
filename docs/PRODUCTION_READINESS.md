@@ -19,8 +19,8 @@ each lands.
 | 4 | One error model (RFC 9457) across every endpoint, leaking nothing | todo |
 | 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | todo |
 | 6 | Wall-clock budgets per node and per run | todo |
-| 7 | Per-org daily LLM spend cap (a per-run one already exists) | todo |
-| 8 | Postgres statement/lock timeouts and startup connect retry | todo |
+| 7 | Per-org daily LLM spend cap (a per-run one already exists) | done |
+| 8 | Postgres statement/lock timeouts and startup connect retry | done |
 | 9 | Field-level encryption for client PII at rest | todo |
 | 10 | Client data export and retention-aware purge | todo |
 | 11 | API key rotation and lifecycle visibility | todo |

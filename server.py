@@ -66,7 +66,14 @@ from security import (
     require,
     scoped_query,
 )
-from services import broker, jobs, policy as policy_service, run_service, tax_lots
+from services import (
+    broker,
+    jobs,
+    policy as policy_service,
+    run_service,
+    spend,
+    tax_lots,
+)
 from services.audit import Action, record as record_audit, verify_chain
 from services.performance import (
     compute_performance,
@@ -686,6 +693,7 @@ def system_status(
             "model": settings.GEMINI_MODEL if settings.llm_configured else None,
         },
         "trading_enabled": settings.TRADING_ENABLED,
+        "model_spend_today": spend.status(db, _principal.org_id),
         "market_data": providers,
         "draining": _shutting_down.is_set(),
     }
@@ -1293,6 +1301,15 @@ def trigger_run(
             f"Run limit reached ({settings.RUN_RATE_LIMIT_PER_HOUR} per hour for this "
             f"organisation). Each run costs market-data and model calls.",
         )
+
+    # A count-based rate limit bounds how many runs an org starts, not what
+    # they cost. Checked here rather than mid-run: stopping halfway leaves the
+    # client a half-finished analysis and no report, having already spent most
+    # of the money.
+    try:
+        spend.check(db, principal.org_id)
+    except spend.DailyBudgetExceeded as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
 
     job = jobs.enqueue(
         db,

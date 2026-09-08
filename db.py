@@ -63,6 +63,15 @@ if db_url.startswith("postgres://"):
 if "sqlite" in db_url:
     engine = create_engine(db_url, connect_args={"check_same_thread": False, "timeout": 30})
 else:
+    connect_args = {}
+    options = []
+    if getattr(settings, "DB_STATEMENT_TIMEOUT_MS", 0) > 0:
+        options.append(f"-c statement_timeout={settings.DB_STATEMENT_TIMEOUT_MS}")
+    if getattr(settings, "DB_LOCK_TIMEOUT_MS", 0) > 0:
+        options.append(f"-c lock_timeout={settings.DB_LOCK_TIMEOUT_MS}")
+    if options:
+        connect_args["options"] = " ".join(options)
+
     engine = create_engine(
         db_url,
         pool_size=settings.DB_POOL_SIZE,
@@ -70,6 +79,7 @@ else:
         pool_recycle=settings.DB_POOL_RECYCLE_SECONDS,
         pool_pre_ping=True,  # a recycled connection killed by the server is
         # otherwise discovered as a failed query, not a reconnect
+        connect_args=connect_args,
     )
 
 
@@ -1056,14 +1066,25 @@ class session_scope:
 
 
 def init_db():
-    """Create any missing tables.
+    """Create any missing tables with retry for transient startup races.
 
     Alembic owns schema evolution (`alembic upgrade head`); this exists so a
     fresh local checkout and the test suite can stand up a database without
     running migrations first. It creates missing tables but never alters
     existing ones, so it is not a substitute for a migration.
     """
-    Base.metadata.create_all(bind=engine)
+    retries = getattr(settings, "DB_CONNECT_RETRIES", 1) if "sqlite" not in db_url else 1
+    backoff = getattr(settings, "DB_CONNECT_RETRY_BACKOFF_SECONDS", 1.0)
+    for attempt in range(1, retries + 1):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except Exception:
+            if attempt == retries:
+                raise
+            import time
+            time.sleep(backoff)
+            backoff *= 1.5
 
 
 if __name__ == "__main__":

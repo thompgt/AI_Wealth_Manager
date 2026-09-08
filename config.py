@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_RECYCLE_SECONDS: int = 1800
+    # Milliseconds before an uncompleted query or an unacquired table lock
+    # times out on Postgres. Without these, a dead connection or a hung
+    # transaction pins a pool slot until an operator notices. Zero disables.
+    DB_STATEMENT_TIMEOUT_MS: int = 30_000
+    DB_LOCK_TIMEOUT_MS: int = 10_000
+    # Startup retry for Postgres connections so boot races against the
+    # database container coming up are survivable.
+    DB_CONNECT_RETRIES: int = 5
+    DB_CONNECT_RETRY_BACKOFF_SECONDS: float = 2.0
 
     # --- LLM -----------------------------------------------------------------
     GEMINI_API_KEY: str = "DUMMY_API_KEY"
@@ -59,6 +68,13 @@ class Settings(BaseSettings):
     # Hard ceiling on LLM spend for a single graph run. A retry loop that
     # misbehaves should cost a known maximum, not an unbounded one.
     LLM_RUN_BUDGET_USD: float = 1.00
+    # Ceiling on what one organisation may spend on models in a UTC day.
+    # LLM_RUN_BUDGET_USD caps a single run, which is the wrong unit for the
+    # bill: a thousand runs each finishing under their own cap is a thousand
+    # times the cap. RUN_RATE_LIMIT_PER_HOUR does not help either -- it is a
+    # count, and a count times an unknown per-run cost is an unknown. Zero or
+    # less means unlimited.
+    LLM_ORG_DAILY_BUDGET_USD: float = 25.00
 
     # --- Market data ---------------------------------------------------------
     # Ordered failover chain. The first provider with credentials configured
