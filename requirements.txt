@@ -31,6 +31,7 @@ pydantic-settings==2.14.2
 # each environment -- and eventually to only some of them.
 alembic==1.18.5
 email-validator==2.3.0
+google-cloud-bigquery==3.45.0
 
 # Auth
 # bcrypt is used directly rather than through passlib: passlib 1.7.4 reads

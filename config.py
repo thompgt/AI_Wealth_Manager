@@ -45,6 +45,15 @@ class Settings(BaseSettings):
     DB_CONNECT_RETRIES: int = 5
     DB_CONNECT_RETRY_BACKOFF_SECONDS: float = 2.0
 
+    # --- BigQuery analytics lakehouse ----------------------------------------
+    # Analytical export for portfolio snapshots, recommendation outcomes,
+    # and regulatory audit logs. Off by default so local development and
+    # tests require no GCP project or credentials.
+    BIGQUERY_ENABLED: bool = False
+    BIGQUERY_PROJECT_ID: Optional[str] = None
+    BIGQUERY_DATASET: str = "wealth_manager_analytics"
+    BIGQUERY_LOCATION: str = "US"
+
     # --- LLM -----------------------------------------------------------------
     GEMINI_API_KEY: str = "DUMMY_API_KEY"
     # Model id used by every LLM-backed agent. Kept in config rather than

@@ -701,6 +701,17 @@ def record_recommendations(
             created += 1
 
     db.flush()
+    if created > 0:
+        try:
+            from services import bigquery_service
+            new_outcomes = (
+                db.query(RecommendationOutcome)
+                .filter(RecommendationOutcome.run_id == run_id)
+                .all()
+            )
+            bigquery_service.stream_recommendation_outcomes(new_outcomes)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not stream recorded recommendations to BigQuery.")
     return created
 
 
@@ -809,6 +820,13 @@ def evaluate_outcomes(db: Session, *, as_of: Optional[datetime] = None, limit: i
         evaluated += 1
 
     db.flush()
+    if evaluated > 0:
+        try:
+            from services import bigquery_service
+            evaluated_rows = [o for o in due if o.status == "evaluated"]
+            bigquery_service.stream_recommendation_outcomes(evaluated_rows)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not stream evaluated recommendations to BigQuery.")
     logger.info("Evaluated %d recommendation outcome(s).", evaluated)
     return evaluated
 

@@ -171,6 +171,12 @@ def record(
         # in the same transaction, without committing.
         db.flush()
 
+    try:
+        from services import bigquery_service
+        bigquery_service.stream_audit_log(event)
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not stream audit event to BigQuery.")
+
     logger.debug("audit %s org=%s entity=%s:%s", action, org_id, entity_type, entity_id)
     return event
 

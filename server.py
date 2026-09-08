@@ -67,6 +67,7 @@ from security import (
     scoped_query,
 )
 from services import (
+    bigquery_service,
     broker,
     jobs,
     policy as policy_service,
@@ -694,6 +695,7 @@ def system_status(
         },
         "trading_enabled": settings.TRADING_ENABLED,
         "model_spend_today": spend.status(db, _principal.org_id),
+        "bigquery": bigquery_service.status(),
         "market_data": providers,
         "draining": _shutting_down.is_set(),
     }
@@ -1827,4 +1829,30 @@ def list_audit_events(
         }
         for e in events
     ]
+
+
+# --- Analytics & BigQuery ----------------------------------------------------
+
+
+@app.get("/api/v1/analytics/bigquery/status")
+def bigquery_analytics_status(
+    principal: Principal = Depends(require("analytics:sync")),
+):
+    """Report BigQuery analytical lakehouse connectivity and dataset status."""
+    return bigquery_service.status()
+
+
+@app.post("/api/v1/maintenance/sync-bigquery")
+def sync_bigquery_lakehouse(
+    principal: Principal = Depends(require("analytics:sync")),
+    db: Session = Depends(get_db),
+):
+    """Backfill snapshots, outcomes, and audit logs for this organization to BigQuery."""
+    if not settings.BIGQUERY_ENABLED:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "BigQuery is not enabled on this deployment (BIGQUERY_ENABLED=false).",
+        )
+    counts = bigquery_service.sync_all(db, org_id=principal.org_id)
+    return {"status": "synced", "counts": counts}
 

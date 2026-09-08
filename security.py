@@ -77,6 +77,7 @@ CAPABILITIES: Dict[str, str] = {
     "audit:read": "compliance",
     "admin:users": "admin",
     "admin:keys": "admin",
+    "analytics:sync": "admin",
 }
 
 API_KEY_PREFIX = "awm"

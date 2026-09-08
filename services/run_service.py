@@ -321,7 +321,10 @@ def persist_run(
         )
 
     try:
-        capture_snapshot(db, client)
+        snapshot = capture_snapshot(db, client)
+        if snapshot is not None:
+            from services import bigquery_service
+            bigquery_service.stream_portfolio_snapshot(snapshot)
     except Exception:  # noqa: BLE001 -- a snapshot failure must not fail the run
         logger.warning("Could not capture a portfolio snapshot for client %s.", client.id)
 
