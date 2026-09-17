@@ -24,6 +24,8 @@ x-app-env: &app-env
   BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?set BOOTSTRAP_ADMIN_PASSWORD in .env}
   GEMINI_API_KEY: ${GEMINI_API_KEY:?set GEMINI_API_KEY in .env}
   CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:8765}
+  MYSQL_ANALYTICS_ENABLED: ${MYSQL_ANALYTICS_ENABLED:-true}
+  MYSQL_ANALYTICS_URL: mysql+pymysql://wealth_analyst:${MYSQL_PASSWORD:-wealth_analyst_secret}@mysql:3306/wealth_analytics
   # Postgres backs the checkpointer when the app points at Postgres, so this
   # path is unused here. Kept pointing at the volume so a misconfiguration
   # writes somewhere durable rather than into the container layer.
@@ -53,6 +55,26 @@ services:
     # published 5432 on a developer's machine is a database on their LAN.
     expose:
       - "5432"
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: wealth_analytics
+      MYSQL_USER: wealth_analyst
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-wealth_analyst_secret}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_secret}
+    volumes:
+      - mysqldata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "wealth_analyst", "-pwealth_analyst_secret"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    # Not published. Nothing outside this network needs the database, and a
+    # published 3306 on a developer's machine is a database on their LAN.
+    expose:
+      - "3306"
 
   # Migrations run once, in their own container, before either process that
   # would use the new schema. Running them from an application entrypoint
@@ -131,4 +153,5 @@ services:
 
 volumes:
   pgdata:
+  mysqldata:
   appdata:

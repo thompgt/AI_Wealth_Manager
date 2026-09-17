@@ -45,14 +45,11 @@ class Settings(BaseSettings):
     DB_CONNECT_RETRIES: int = 5
     DB_CONNECT_RETRY_BACKOFF_SECONDS: float = 2.0
 
-    # --- BigQuery analytics lakehouse ----------------------------------------
+    # --- MySQL analytics lakehouse -------------------------------------------
     # Analytical export for portfolio snapshots, recommendation outcomes,
-    # and regulatory audit logs. Off by default so local development and
-    # tests require no GCP project or credentials.
-    BIGQUERY_ENABLED: bool = False
-    BIGQUERY_PROJECT_ID: Optional[str] = None
-    BIGQUERY_DATASET: str = "wealth_manager_analytics"
-    BIGQUERY_LOCATION: str = "US"
+    # and regulatory audit logs using a dockerized MySQL analytics store.
+    MYSQL_ANALYTICS_ENABLED: bool = False
+    MYSQL_ANALYTICS_URL: str = "mysql+pymysql://wealth_analyst:wealth_analyst_secret@localhost:3306/wealth_analytics"
 
     # --- MLflow --------------------------------------------------------------
     MLFLOW_ENABLED: bool = True

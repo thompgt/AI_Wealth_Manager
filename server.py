@@ -67,9 +67,9 @@ from security import (
     scoped_query,
 )
 from services import (
-    bigquery_service,
     broker,
     jobs,
+    mysql_analytics,
     policy as policy_service,
     run_service,
     spend,
@@ -722,7 +722,7 @@ def system_status(
         },
         "trading_enabled": settings.TRADING_ENABLED,
         "model_spend_today": spend.status(db, _principal.org_id),
-        "bigquery": bigquery_service.status(),
+        "analytics_lakehouse": mysql_analytics.status(),
         "market_data": providers,
         "draining": _shutting_down.is_set(),
     }
@@ -1858,28 +1858,30 @@ def list_audit_events(
     ]
 
 
-# --- Analytics & BigQuery ----------------------------------------------------
+# --- Analytics & MySQL Lakehouse ---------------------------------------------
 
 
+@app.get("/api/v1/analytics/lakehouse/status")
 @app.get("/api/v1/analytics/bigquery/status")
-def bigquery_analytics_status(
+def analytics_lakehouse_status(
     principal: Principal = Depends(require("analytics:sync")),
 ):
-    """Report BigQuery analytical lakehouse connectivity and dataset status."""
-    return bigquery_service.status()
+    """Report MySQL analytical lakehouse connectivity and table status."""
+    return mysql_analytics.status()
 
 
+@app.post("/api/v1/maintenance/sync-analytics")
 @app.post("/api/v1/maintenance/sync-bigquery")
-def sync_bigquery_lakehouse(
+def sync_analytics_lakehouse(
     principal: Principal = Depends(require("analytics:sync")),
     db: Session = Depends(get_db),
 ):
-    """Backfill snapshots, outcomes, and audit logs for this organization to BigQuery."""
-    if not settings.BIGQUERY_ENABLED:
+    """Backfill snapshots, outcomes, and audit logs for this organization to MySQL analytics."""
+    if not settings.MYSQL_ANALYTICS_ENABLED:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "BigQuery is not enabled on this deployment (BIGQUERY_ENABLED=false).",
+            "MySQL analytics is not enabled on this deployment (MYSQL_ANALYTICS_ENABLED=false).",
         )
-    counts = bigquery_service.sync_all(db, org_id=principal.org_id)
+    counts = mysql_analytics.sync_all(db, org_id=principal.org_id)
     return {"status": "synced", "counts": counts}
 
