@@ -434,6 +434,13 @@ def diagnostics_node(state: AgentState) -> dict:
                 )
                 logger.info("[Diagnostics] %s", ctx.summary)
 
+                try:
+                    from services import mlflow_service
+                    run_id = state.get("run_id") or "unknown"
+                    mlflow_service.log_portfolio_metrics(run_id, stats, weights)
+                except Exception:
+                    pass
+
                 for warning in view.warnings:
                     if "no current price" in warning.lower():
                         ctx.degrade(

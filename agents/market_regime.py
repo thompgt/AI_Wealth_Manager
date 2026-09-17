@@ -568,6 +568,18 @@ def market_regime_node(state: AgentState) -> dict:
         )
         logger.info("[Regime] %s", ctx.summary)
 
+        try:
+            from services import mlflow_service
+            run_id = state.get("run_id") or "unknown"
+            mlflow_service.log_regime_inference(
+                run_id,
+                regime["regime_label"],
+                regime["confidence"],
+                signals,
+            )
+        except Exception:
+            pass
+
     if regime is None:
         regime = MarketRegime(
             regime_label="Volatile",

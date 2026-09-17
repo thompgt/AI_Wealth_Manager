@@ -384,4 +384,19 @@ def invoke_tracked(
     if usage.cost_usd:
         llm_cost.labels(node).inc(usage.cost_usd)
 
+    try:
+        from logging_setup import current_context
+        from services import mlflow_service
+        run_id = current_context().get("run_id") or "unknown"
+        mlflow_service.log_llm_generation(
+            run_id=run_id,
+            node=node,
+            model=settings.GEMINI_MODEL,
+            prompt_tokens=usage.prompt_tokens or 0,
+            completion_tokens=usage.completion_tokens or 0,
+            latency_ms=0.0,
+        )
+    except Exception:
+        pass
+
     return response, usage

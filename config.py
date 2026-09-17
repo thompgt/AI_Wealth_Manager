@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     BIGQUERY_DATASET: str = "wealth_manager_analytics"
     BIGQUERY_LOCATION: str = "US"
 
+    # --- MLflow --------------------------------------------------------------
+    MLFLOW_ENABLED: bool = True
+    MLFLOW_TRACKING_URI: str = "file:./mlruns"
+    MLFLOW_EXPERIMENT_NAME: str = "ai-wealth-manager"
+
     # --- LLM -----------------------------------------------------------------
     GEMINI_API_KEY: str = "DUMMY_API_KEY"
     # Model id used by every LLM-backed agent. Kept in config rather than

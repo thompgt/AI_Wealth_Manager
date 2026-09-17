@@ -532,7 +532,20 @@ def run_client_graph(client_id: int, run_id: Optional[str] = None) -> dict:
         run_deadline(),
     ):
         logger.info("Starting analysis run for client %s", client_id)
-        result = get_workflow().invoke(initial_state, config=config)
+        try:
+            from services import mlflow_service
+            mlflow_service.start_run(resolved_run_id, tags={"client_id": client_id})
+        except Exception:
+            pass
+
+        try:
+            result = get_workflow().invoke(initial_state, config=config)
+        finally:
+            try:
+                from services import mlflow_service
+                mlflow_service.end_run(resolved_run_id)
+            except Exception:
+                pass
 
     return {"run_id": resolved_run_id, "result": result}
 
