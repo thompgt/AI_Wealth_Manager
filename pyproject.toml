@@ -1,3 +1,56 @@
+[project]
+name = "ai-wealth-manager"
+version = "2.0.0"
+description = "Multi-agent portfolio analysis, wealth management, and deterministic guardrails"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+dependencies = [
+    "fastapi==0.139.0",
+    "uvicorn==0.51.0",
+    "httpx==0.28.1",
+    "langgraph==1.2.9",
+    "langgraph-checkpoint-sqlite==3.1.0",
+    "langchain-core==1.4.9",
+    "langchain-google-genai==4.2.7",
+    "sqlalchemy==2.0.51",
+    "psycopg2-binary==2.9.12",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "alembic==1.18.5",
+    "email-validator==2.3.0",
+    "google-cloud-bigquery==3.45.0",
+    "bcrypt==5.0.0",
+    "pyjwt==2.12.1",
+    "prometheus-client==0.24.1",
+    "numpy==2.5.1",
+    "pandas==3.0.3",
+    "yfinance==1.5.1",
+    "ddgs==9.14.4",
+    "requests==2.34.2",
+    "python-dotenv==1.2.2",
+    "solara==1.60.3",
+    "plotly==6.9.0",
+    "anywidget==0.11.0",
+    "mlflow>=2.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "ruff==0.14.6",
+]
+notebook = [
+    "jupyterlab>=4.0.0",
+    "kaleido>=0.2.1",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=9.0",
+    "ruff>=0.14",
+]
+
 [tool.pytest.ini_options]
 # Discovery was resting entirely on tests/conftest.py inserting the repo root
 # into sys.path, which works when pytest is invoked from the repo root and

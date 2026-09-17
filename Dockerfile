@@ -15,8 +15,10 @@
 # ---------------------------------------------------------------------------
 FROM python:3.13-slim AS builder
 
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
 # build-essential for any sdist that still needs a compiler; libpq-dev for
 # psycopg2. Both stay in this stage.
@@ -24,16 +26,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential libpq-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# A virtualenv rather than --user or the system site-packages: it is one
-# self-contained directory to copy into the runtime stage, with no ambiguity
-# about which interpreter owns which package.
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Use uv to create the virtual environment and install pinned dependencies
+RUN uv venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    VIRTUAL_ENV="/opt/venv"
 
-# Copied alone, before the source, so editing an agent does not reinstall
-# pandas. The pins make this layer genuinely reproducible.
-COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+COPY pyproject.toml requirements.txt ./
+RUN uv pip install -r requirements.txt
 
 # ---------------------------------------------------------------------------
 FROM python:3.13-slim AS runtime
