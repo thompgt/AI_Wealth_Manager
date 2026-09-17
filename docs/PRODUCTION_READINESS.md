@@ -29,7 +29,7 @@ each lands.
 | 14 | Alert rules for the failure modes that return HTTP 200 | done |
 | 15 | Load and soak harness, with capacity numbers written down | done |
 | 16 | Operations runbook: deploy, rollback, restore, incident triage | done |
-| 17 | Threat model, security policy, licence | todo |
+| 17 | Threat model, security policy, licence | done |
 | 18 | README rewritten against the architecture that exists today | todo |
 | 19 | Reconnect the dashboard: it does not import, and calls a removed endpoint | done |
 
