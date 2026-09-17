@@ -10,7 +10,7 @@ dependencies = [
     "uvicorn==0.51.0",
     "httpx==0.28.1",
     "langgraph==1.2.9",
-    "langgraph-checkpoint-sqlite==3.1.0",
+    "langgraph-checkpoint-sqlite==3.1.1",
     "langchain-core==1.4.9",
     "langchain-google-genai==4.2.7",
     "sqlalchemy==2.0.51",
@@ -20,9 +20,9 @@ dependencies = [
     "alembic==1.18.5",
     "email-validator==2.3.0",
     "pymysql==1.1.1",
-    "cryptography==44.0.1",
+    "cryptography==50.0.1",
     "bcrypt==5.0.0",
-    "pyjwt==2.12.1",
+    "pyjwt==2.14.0",
     "prometheus-client==0.24.1",
     "numpy==2.5.1",
     "pandas==3.0.3",
@@ -39,6 +39,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest==9.1.1",
+    "pytest-cov==6.0.0",
+    "pip-audit==2.8.0",
     "ruff==0.14.6",
 ]
 notebook = [
@@ -49,6 +51,8 @@ notebook = [
 [tool.uv]
 dev-dependencies = [
     "pytest>=9.0",
+    "pytest-cov>=6.0",
+    "pip-audit>=2.8",
     "ruff>=0.14",
 ]
 

@@ -17,3 +17,5 @@ checkpoints.sqlite*
 .venv/
 venv/
 .ipynb_checkpoints/
+.coverage
+coverage.xml

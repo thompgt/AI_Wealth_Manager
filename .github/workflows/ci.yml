@@ -28,6 +28,21 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: wealthmanager_ci
+          POSTGRES_USER: ci_user
+          POSTGRES_PASSWORD: ci_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -35,9 +50,7 @@ jobs:
         with:
           # Single version on purpose. The dependency set is pinned to exact
           # versions precisely so every install resolves identically, and this
-          # is the interpreter the pins were verified against. A matrix here
-          # would be testing whether pandas and yfinance publish wheels for
-          # other versions, which is not this repo's risk.
+          # is the interpreter the pins were verified against.
           python-version: "3.13"
           cache: pip
           cache-dependency-path: requirements.txt
@@ -50,30 +63,37 @@ jobs:
       - name: Lint
         run: ruff check .
 
-      - name: Migrations apply from empty
-        # Catches the failure create_all cannot: a model changed and no
-        # migration was written for it. Runs against SQLite because the point
-        # is whether the migration chain is coherent, not which engine runs it.
+      - name: Dependency security audit
+        # Scans pinned packages against the Python Packaging Advisory Database.
+        run: pip-audit -r requirements.txt --desc on
+
+      - name: Postgres migrations apply from empty
+        # Runs Alembic against a real PostgreSQL instance to verify native DDL
+        # and type compatibility that SQLite cannot catch.
         env:
-          NEON_DATABASE_URL: sqlite:///./ci-migrations.db
+          NEON_DATABASE_URL: postgresql://ci_user:ci_password@localhost:5432/wealthmanager_ci
         run: alembic upgrade head
 
-      - name: Migrations match the models
-        # `alembic check` autogenerates against the just-migrated database and
-        # fails if it finds anything to emit. Without this, a column added to
-        # db.py works locally forever -- SQLite is created from the models in
-        # tests -- and only fails on a real deployment, which is the worst
-        # possible place to discover it.
+      - name: Postgres migrations match the models
+        # `alembic check` autogenerates against the migrated PostgreSQL schema
+        # and fails if any model changes are missing from migration files.
         env:
-          NEON_DATABASE_URL: sqlite:///./ci-migrations.db
+          NEON_DATABASE_URL: postgresql://ci_user:ci_password@localhost:5432/wealthmanager_ci
         run: alembic check
 
-      - name: Migrations reverse
-        # A downgrade path nobody exercises is a downgrade path that does not
-        # work, which matters exactly once, under pressure, during a rollback.
+      - name: Postgres migrations reverse to base
+        # Validates that rollback DDL executes cleanly without foreign key
+        # locks or table drop failures under real PostgreSQL semantics.
         env:
-          NEON_DATABASE_URL: sqlite:///./ci-migrations.db
+          NEON_DATABASE_URL: postgresql://ci_user:ci_password@localhost:5432/wealthmanager_ci
         run: alembic downgrade base
 
-      - name: Tests
-        run: pytest
+      - name: Postgres migrations re-apply to head
+        env:
+          NEON_DATABASE_URL: postgresql://ci_user:ci_password@localhost:5432/wealthmanager_ci
+        run: alembic upgrade head
+
+      - name: Tests with coverage floor enforcement
+        # Runs the full test suite and enforces a minimum 65% code coverage gate
+        # across all core agent, service, server, and model modules.
+        run: pytest --cov=agents --cov=services --cov=server --cov=db --cov-report=term --cov-report=xml --cov-fail-under=65

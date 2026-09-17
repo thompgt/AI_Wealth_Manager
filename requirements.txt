@@ -17,7 +17,7 @@ httpx==0.28.1
 
 # Orchestration
 langgraph==1.2.9
-langgraph-checkpoint-sqlite==3.1.0   # durable human-in-the-loop checkpoints
+langgraph-checkpoint-sqlite==3.1.1   # durable human-in-the-loop checkpoints
 langchain-core==1.4.9
 langchain-google-genai==4.2.7
 
@@ -32,14 +32,14 @@ pydantic-settings==2.14.2
 alembic==1.18.5
 email-validator==2.3.0
 pymysql==1.1.1
-cryptography==44.0.1
+cryptography==50.0.1
 
 # Auth
 # bcrypt is used directly rather than through passlib: passlib 1.7.4 reads
 # bcrypt.__about__, which bcrypt 4.1 removed, so the combination emits errors
 # on every hash.
 bcrypt==5.0.0
-pyjwt==2.12.1
+pyjwt==2.14.0
 
 # Observability
 prometheus-client==0.24.1
@@ -74,4 +74,6 @@ anywidget==0.11.0
 
 # Testing and linting
 pytest==9.1.1
+pytest-cov==6.0.0
+pip-audit==2.8.0
 ruff==0.14.6
