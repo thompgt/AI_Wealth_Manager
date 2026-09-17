@@ -51,6 +51,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 from config import settings
+from services.encryption import EncryptedDateTime, EncryptedString, EncryptedText
 
 # --- Engine ------------------------------------------------------------------
 
@@ -302,9 +303,9 @@ class ClientProfile(Base):
     advisor_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
 
     name = Column(String(200), nullable=False, index=True)
-    email = Column(String(320), nullable=True)
-    phone = Column(String(50), nullable=True)
-    date_of_birth = Column(DateTime, nullable=True)
+    email = Column(EncryptedString, nullable=True)
+    phone = Column(EncryptedString, nullable=True)
+    date_of_birth = Column(EncryptedDateTime, nullable=True)
     age = Column(Integer, nullable=True)
 
     # The tier is derived from a scored questionnaire (see RiskAssessment),
@@ -318,7 +319,7 @@ class ClientProfile(Base):
     # Free-text constraints the client has stated (e.g. "no tobacco", "keep
     # the inherited MSFT"). Surfaced to the research agent as context and to
     # the report as disclosure.
-    notes = Column(Text, nullable=True)
+    notes = Column(EncryptedText, nullable=True)
 
     status = Column(String(32), nullable=False, default="active")  # active | prospect | archived
     kyc_status = Column(String(32), nullable=False, default="pending")  # pending | verified | failed

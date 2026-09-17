@@ -153,6 +153,12 @@ class Settings(BaseSettings):
     LOGIN_MAX_FAILURES: int = 5
     LOGIN_LOCKOUT_MINUTES: int = 15
 
+    # --- Data Protection / Field-Level Encryption ----------------------------
+    # 32-byte URL-safe base64-encoded key for Fernet field-level encryption of PII.
+    # If left empty in development, a deterministic key derived from JWT_SECRET
+    # is used so development/testing works seamlessly out of the box.
+    FIELD_ENCRYPTION_KEY: str = ""
+
     # Comma-separated list of origins allowed to call the API from a browser.
     CORS_ALLOW_ORIGINS: str = "http://localhost:8765,http://localhost:8766"
     # Requests per minute per authenticated principal, and the much tighter
@@ -300,6 +306,11 @@ class Settings(BaseSettings):
             problems.append(
                 "CORS_ALLOW_ORIGINS still contains a localhost origin. Set the "
                 "real dashboard origin(s) for this deployment."
+            )
+        if not self.FIELD_ENCRYPTION_KEY:
+            problems.append(
+                "FIELD_ENCRYPTION_KEY is unset -- client PII (email, phone, DOB, notes) "
+                "must be encrypted at rest outside development. Generate a 32-byte Fernet key."
             )
         return problems
 

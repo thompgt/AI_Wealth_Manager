@@ -21,7 +21,7 @@ each lands.
 | 6 | Wall-clock budgets per node and per run | done |
 | 7 | Per-org daily LLM spend cap (a per-run one already exists) | done |
 | 8 | Postgres statement/lock timeouts and startup connect retry | done |
-| 9 | Field-level encryption for client PII at rest | todo |
+| 9 | Field-level encryption for client PII at rest | done |
 | 10 | Client data export and retention-aware purge | todo |
 | 11 | API key rotation and lifecycle visibility | todo |
 | 12 | Prompt-injection red-team and golden-fixture agent evals | todo |
