@@ -24,7 +24,7 @@ each lands.
 | 9 | Field-level encryption for client PII at rest | done |
 | 10 | Client data export and retention-aware purge | done |
 | 11 | API key rotation and lifecycle visibility | done |
-| 12 | Prompt-injection red-team and golden-fixture agent evals | todo |
+| 12 | Prompt-injection red-team and golden-fixture agent evals | done |
 | 13 | CI: Postgres migrations, dependency audit, coverage floor | todo |
 | 14 | Alert rules for the failure modes that return HTTP 200 | todo |
 | 15 | Load and soak harness, with capacity numbers written down | todo |
