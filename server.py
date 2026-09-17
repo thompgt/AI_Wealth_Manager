@@ -1340,16 +1340,19 @@ def trigger_run(
     except spend.DailyBudgetExceeded as exc:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
 
+    request_id = getattr(request.state, "request_id", None) or request.headers.get("x-request-id")
     job = jobs.enqueue(
         db,
         job_type=run_service.JOB_TYPE,
         org_id=principal.org_id,
         client_id=client.id,
         requested_by_user_id=principal.user_id,
+        correlation_id=request_id,
     )
     db.commit()
     return {
         "job_id": job.job_id,
+        "correlation_id": job.correlation_id,
         "status": job.status,
         "client_id": client.id,
         "poll": f"/api/v1/jobs/{job.job_id}",

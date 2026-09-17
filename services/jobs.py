@@ -114,6 +114,7 @@ def enqueue(
         org_id=org_id,
         client_id=client_id,
         job_type=job_type,
+        correlation_id=correlation_id,
         status="queued",
         priority=priority,
         payload={**(payload or {}), "correlation_id": correlation_id} if correlation_id
@@ -349,11 +350,13 @@ class JobWorker:
 
         # request_id is rebound from the payload so every line this job emits
         # carries the id of the request that asked for it, however long ago.
+        effective_correlation = job.correlation_id or (job.payload or {}).get("correlation_id")
         with log_context(
             job_id=job.job_id,
             client_id=job.client_id,
             run_id=job.run_id,
-            request_id=(job.payload or {}).get("correlation_id"),
+            request_id=effective_correlation,
+            correlation_id=effective_correlation,
         ):
             if handler is None:
                 job.status = "failed"
@@ -484,6 +487,7 @@ def job_to_dict(job: Job) -> Dict[str, Any]:
         "status": job.status,
         "client_id": job.client_id,
         "run_id": job.run_id,
+        "correlation_id": job.correlation_id,
         "progress_pct": round(job.progress_pct or 0.0, 1),
         "current_step": job.current_step,
         "attempts": job.attempts,

@@ -902,6 +902,7 @@ class Job(Base):
                        nullable=True, index=True)
     job_type = Column(String(48), nullable=False, default="analysis_run")
     run_id = Column(String(64), nullable=True, index=True)
+    correlation_id = Column(String(64), nullable=True, index=True)
     status = Column(String(16), nullable=False, default="queued", index=True)
     priority = Column(Integer, nullable=False, default=100)
     payload = Column(JSON, nullable=False, default=dict)

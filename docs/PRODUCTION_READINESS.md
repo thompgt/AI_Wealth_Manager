@@ -15,10 +15,10 @@ each lands.
 |---|---|---|
 | 1 | Container images and a compose stack that runs api + worker + Postgres | done |
 | 2 | Split liveness from readiness; readiness checks deps and schema version | done |
-| 3 | Correlation ids that survive the request/job boundary | todo |
-| 4 | One error model (RFC 9457) across every endpoint, leaking nothing | todo |
+| 3 | Correlation ids that survive the request/job boundary | done |
+| 4 | One error model (RFC 9457) across every endpoint, leaking nothing | done |
 | 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | todo |
-| 6 | Wall-clock budgets per node and per run | todo |
+| 6 | Wall-clock budgets per node and per run | done |
 | 7 | Per-org daily LLM spend cap (a per-run one already exists) | done |
 | 8 | Postgres statement/lock timeouts and startup connect retry | done |
 | 9 | Field-level encryption for client PII at rest | todo |
