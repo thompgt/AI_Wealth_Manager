@@ -30,7 +30,7 @@ each lands.
 | 15 | Load and soak harness, with capacity numbers written down | done |
 | 16 | Operations runbook: deploy, rollback, restore, incident triage | done |
 | 17 | Threat model, security policy, licence | done |
-| 18 | README rewritten against the architecture that exists today | todo |
+| 18 | README rewritten against the architecture that exists today | done |
 | 19 | Reconnect the dashboard: it does not import, and calls a removed endpoint | done |
 
 ## Why these, and not features
