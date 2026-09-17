@@ -127,6 +127,8 @@ def run_benchmark(
     soak_duration_seconds: Optional[float] = None,
 ) -> BenchmarkResult:
     """Run concurrent load against key API endpoints."""
+    import server
+    server._shutting_down.clear()
     client = TestClient(app)
     headers = _make_auth_header()
 
