@@ -27,7 +27,7 @@ each lands.
 | 12 | Prompt-injection red-team and golden-fixture agent evals | done |
 | 13 | CI: Postgres migrations, dependency audit, coverage floor | done |
 | 14 | Alert rules for the failure modes that return HTTP 200 | done |
-| 15 | Load and soak harness, with capacity numbers written down | todo |
+| 15 | Load and soak harness, with capacity numbers written down | done |
 | 16 | Operations runbook: deploy, rollback, restore, incident triage | todo |
 | 17 | Threat model, security policy, licence | todo |
 | 18 | README rewritten against the architecture that exists today | todo |
