@@ -205,8 +205,17 @@ def claim_next(db: Session, worker_id: str = WORKER_ID) -> Optional[Job]:
         return None
 
     db.refresh(candidate)
-    if candidate.queued_at:
-        job_wait_seconds.observe(max(0.0, (now - candidate.queued_at).total_seconds()))
+    wait_time = max(0.0, (now - candidate.queued_at).total_seconds()) if candidate.queued_at else 0.0
+    job_wait_seconds.observe(wait_time)
+    logger.info(
+        "Claimed job %s (%s) attempt %d/%d after waiting %.2fs by worker %s",
+        candidate.job_id,
+        candidate.job_type,
+        candidate.attempts,
+        candidate.max_attempts,
+        wait_time,
+        worker_id,
+    )
     return candidate
 
 
@@ -224,6 +233,13 @@ def heartbeat(db: Session, job: Job, *, step: Optional[str] = None,
         job.progress_pct = max(0.0, min(100.0, progress))
     db.commit()
     db.refresh(job)
+    logger.debug(
+        "Job %s heartbeat (step=%r, progress=%.1f%%, cancel_requested=%s)",
+        job.job_id,
+        job.current_step,
+        job.progress_pct or 0.0,
+        job.cancel_requested,
+    )
     return not job.cancel_requested
 
 

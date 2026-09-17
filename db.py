@@ -103,8 +103,46 @@ def _sqlite_pragmas(dbapi_connection, connection_record):
     cursor.close()
 
 
+import time
+from logging_setup import get_logger
+
+logger = get_logger(__name__)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+@event.listens_for(Engine, "before_cursor_execute")
+def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    context._query_start_time = time.perf_counter()
+
+
+@event.listens_for(Engine, "after_cursor_execute")
+def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+    start = getattr(context, "_query_start_time", None)
+    if start is not None:
+        duration_ms = (time.perf_counter() - start) * 1000
+        slow_threshold = getattr(settings, "SLOW_QUERY_THRESHOLD_MS", 200)
+        if duration_ms >= slow_threshold:
+            short_stmt = " ".join(statement.split())[:250]
+            logger.warning("Slow DB query (%.2fms >= %sms): %s", duration_ms, slow_threshold, short_stmt)
+        else:
+            logger.debug("DB query executed in %.2fms", duration_ms)
+
+
+@event.listens_for(Session, "after_begin")
+def _after_begin(session, transaction, connection):
+    logger.debug("DB transaction started")
+
+
+@event.listens_for(Session, "after_rollback")
+def _after_rollback(session):
+    logger.debug("DB transaction rolled back")
+
+
+@event.listens_for(Session, "after_commit")
+def _after_commit(session):
+    logger.debug("DB transaction committed")
 
 
 def utcnow() -> datetime:

@@ -182,15 +182,42 @@ async def observability_middleware(request: Request, call_next):
     # the logs for that request carry -- without which "quote the id in the
     # error" gives support an id that appears nowhere in the logs.
     request.state.request_id = request_id
+    client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "-")
     started = time.perf_counter()
 
     with log_context(request_id=request_id):
+        logger.debug(
+            "HTTP IN  %s %s [client=%s ua=%r request_id=%s]",
+            request.method,
+            request.url.path,
+            client_ip,
+            user_agent[:60],
+            request_id,
+        )
         try:
             response = await call_next(request)
         except Exception:
-            logger.exception("Unhandled error handling %s %s", request.method, request.url.path)
+            logger.exception("Unhandled error handling %s %s [client=%s]", request.method, request.url.path, client_ip)
             raise
         elapsed = time.perf_counter() - started
+
+        log_level = logging.INFO
+        if response.status_code >= 500:
+            log_level = logging.ERROR
+        elif response.status_code >= 400:
+            log_level = logging.WARNING
+
+        logger.log(
+            log_level,
+            "HTTP OUT %s %s -> %d (%.2fms) [client=%s request_id=%s]",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed * 1000,
+            client_ip,
+            request_id,
+        )
 
     route = request.scope.get("route")
     template = getattr(route, "path", request.url.path)

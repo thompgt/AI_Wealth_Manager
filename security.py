@@ -259,17 +259,25 @@ def get_principal(
     x_api_key: Optional[str] = Header(default=None),
 ) -> Principal:
     """Resolve the caller. Raises 401 if it cannot."""
+    client_ip = request.client.host if request.client else "unknown"
     if authorization and authorization.lower().startswith("bearer "):
-        payload = decode_token(authorization.split(" ", 1)[1].strip())
+        try:
+            payload = decode_token(authorization.split(" ", 1)[1].strip())
+        except Exception as exc:
+            logger.warning("Auth failed: invalid token from %s on %s: %s", client_ip, request.url.path, exc)
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token.")
         if payload.get("type") != "access":
+            logger.warning("Auth failed: refresh token presented as access token from %s on %s", client_ip, request.url.path)
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED,
                 "Refresh tokens cannot be used to call the API; exchange it first.",
             )
         user = db.query(User).filter(User.id == int(payload["sub"])).first()
         if user is None or not user.is_active:
+            logger.warning("Auth failed: user %s inactive or missing from %s", payload.get("sub"), client_ip)
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Account is inactive.")
         if user.token_version != payload.get("tv"):
+            logger.warning("Auth failed: token version mismatch for user %s from %s", user.id, client_ip)
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED, "Session has been revoked; sign in again."
             )
@@ -283,10 +291,15 @@ def get_principal(
         )
 
     if x_api_key:
-        principal = _principal_from_api_key(db, x_api_key)
-        request.state.principal_label = principal.label
-        return principal
+        try:
+            principal = _principal_from_api_key(db, x_api_key)
+            request.state.principal_label = principal.label
+            return principal
+        except HTTPException:
+            logger.warning("Auth failed: invalid or revoked API key from %s on %s", client_ip, request.url.path)
+            raise
 
+    logger.warning("Auth failed: missing credentials from %s on %s", client_ip, request.url.path)
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED,
         "Authentication required: send `Authorization: Bearer <token>` or `X-API-Key`.",
@@ -304,6 +317,13 @@ def require(capability: str):
     def _dependency(principal: Principal = Depends(get_principal)) -> Principal:
         if not principal.can(capability):
             required = CAPABILITIES.get(capability, "unknown")
+            logger.warning(
+                "Access denied: principal %s (role=%s) denied capability %r (requires %s)",
+                principal.label,
+                principal.role,
+                capability,
+                required,
+            )
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 f"This action requires the '{required}' role or higher; "
