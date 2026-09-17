@@ -22,7 +22,7 @@ each lands.
 | 7 | Per-org daily LLM spend cap (a per-run one already exists) | done |
 | 8 | Postgres statement/lock timeouts and startup connect retry | done |
 | 9 | Field-level encryption for client PII at rest | done |
-| 10 | Client data export and retention-aware purge | todo |
+| 10 | Client data export and retention-aware purge | done |
 | 11 | API key rotation and lifecycle visibility | todo |
 | 12 | Prompt-injection red-team and golden-fixture agent evals | todo |
 | 13 | CI: Postgres migrations, dependency audit, coverage floor | todo |

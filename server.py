@@ -1022,6 +1022,210 @@ def archive_client(
     return Response(status_code=204)
 
 
+@app.get("/api/v1/clients/{client_id}/export")
+def export_client_data(
+    client_id: int,
+    principal: Principal = Depends(require("client:export")),
+    db: Session = Depends(get_db),
+):
+    """Structured export of all client data for GDPR / CCPA privacy portability."""
+    client = (
+        scoped_query(db, ClientProfile, principal)
+        .filter(ClientProfile.id == client_id)
+        .first()
+    )
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found.")
+
+    accounts_data = []
+    for a in client.accounts:
+        lots = (
+            db.query(TaxLot)
+            .filter(TaxLot.account_id == a.id)
+            .order_by(TaxLot.acquired_at.asc())
+            .all()
+        )
+        accounts_data.append({
+            "id": a.id,
+            "name": a.name,
+            "account_type": a.account_type,
+            "tax_treatment": a.tax_treatment,
+            "custodian": a.custodian,
+            "cash_balance": to_float(a.cash_balance),
+            "is_active": a.is_active,
+            "opened_at": a.opened_at.isoformat() if a.opened_at else None,
+            "tax_lots": [
+                {
+                    "id": lot.id,
+                    "symbol": lot.symbol,
+                    "quantity": float(lot.quantity),
+                    "cost_basis_per_share": float(lot.cost_per_share),
+                    "acquired_at": lot.acquired_at.isoformat() if lot.acquired_at else None,
+                    "term": lot.term,
+                    "disposed_at": lot.disposed_at.isoformat() if lot.disposed_at else None,
+                }
+                for lot in lots
+            ],
+        })
+
+    runs = (
+        db.query(AgentRun)
+        .filter(AgentRun.client_id == client.id)
+        .order_by(AgentRun.started_at.desc())
+        .limit(100)
+        .all()
+    )
+    reports = (
+        db.query(Report)
+        .filter(Report.client_id == client.id)
+        .order_by(Report.generated_at.desc())
+        .limit(100)
+        .all()
+    )
+    approvals = (
+        db.query(Approval)
+        .filter(Approval.client_id == client.id)
+        .order_by(Approval.requested_at.desc())
+        .limit(100)
+        .all()
+    )
+
+    record_audit(
+        db,
+        org_id=principal.org_id,
+        action=Action.CLIENT_EXPORTED,
+        user_id=principal.user_id,
+        entity_type="client",
+        entity_id=client.id,
+        detail={"format": "json"},
+    )
+    db.commit()
+
+    return {
+        "exported_at": utcnow().isoformat(),
+        "exported_by": principal.label,
+        "client": {
+            "id": client.id,
+            "org_id": client.org_id,
+            "name": client.name,
+            "email": client.email,
+            "phone": client.phone,
+            "date_of_birth": client.date_of_birth.isoformat() if client.date_of_birth else None,
+            "age": client.age,
+            "risk_tolerance": client.risk_tolerance,
+            "time_horizon_years": client.time_horizon_years,
+            "goals": list(client.goals or []),
+            "net_worth": to_float(client.net_worth),
+            "annual_income": to_float(client.annual_income) if client.annual_income else None,
+            "liquidity_needs": to_float(client.liquidity_needs) if client.liquidity_needs else None,
+            "notes": client.notes,
+            "status": client.status,
+            "kyc_status": client.kyc_status,
+            "onboarded_at": client.onboarded_at.isoformat() if client.onboarded_at else None,
+            "deleted_at": client.deleted_at.isoformat() if client.deleted_at else None,
+            "created_at": client.created_at.isoformat() if client.created_at else None,
+        },
+        "accounts": accounts_data,
+        "runs": [
+            {
+                "run_id": r.run_id,
+                "node_name": r.node_name,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "cost_usd": float(r.cost_usd or 0.0),
+            }
+            for r in runs
+        ],
+        "reports": [
+            {
+                "run_id": rep.run_id,
+                "version": rep.version,
+                "approval_state": rep.approval_state,
+                "generated_at": rep.generated_at.isoformat() if rep.generated_at else None,
+                "report_text": rep.report_text,
+                "structured_payload": rep.structured_payload,
+            }
+            for rep in reports
+        ],
+        "approvals": [
+            {
+                "run_id": app.run_id,
+                "reason": app.reason,
+                "decision": app.decision,
+                "requested_at": app.requested_at.isoformat() if app.requested_at else None,
+                "decided_at": app.decided_at.isoformat() if app.decided_at else None,
+            }
+            for app in approvals
+        ],
+    }
+
+
+@app.post("/api/v1/clients/{client_id}/purge", status_code=200)
+def purge_client(
+    client_id: int,
+    force: bool = Query(default=False),
+    principal: Principal = Depends(require("client:purge")),
+    db: Session = Depends(get_db),
+):
+    """Permanently delete an archived client once retention requirements are met.
+
+    Books-and-records rules (SEC Rule 17a-4, FINRA Rule 4511) mandate a retention
+    period (default 5 years / 1825 days) for client records following archival.
+    - An active client CANNOT be purged; it must first be archived.
+    - If the client is within the retention period, the purge is rejected with 409
+      unless force=true is explicitly asserted by an admin.
+    - Once confirmed, the client profile and associated accounts are permanently
+      deleted, and a final audit event is recorded.
+    """
+    client = (
+        scoped_query(db, ClientProfile, principal)
+        .filter(ClientProfile.id == client_id)
+        .first()
+    )
+    if client is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Client not found.")
+
+    if client.status != "archived" or client.deleted_at is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Client must be archived before it can be purged.",
+        )
+
+    retention_cutoff = utcnow() - timedelta(days=settings.CLIENT_RETENTION_DAYS)
+    is_expired = client.deleted_at <= retention_cutoff
+
+    if not is_expired and not force:
+        days_remaining = max(1, (client.deleted_at + timedelta(days=settings.CLIENT_RETENTION_DAYS) - utcnow()).days)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Client is within the {settings.CLIENT_RETENTION_DAYS}-day mandatory retention period "
+            f"({days_remaining} days remaining). Purging requires force=true by an administrator.",
+        )
+
+    record_audit(
+        db,
+        org_id=principal.org_id,
+        action=Action.CLIENT_PURGED,
+        user_id=principal.user_id,
+        entity_type="client",
+        entity_id=client.id,
+        detail={
+            "client_name": client.name,
+            "archived_at": client.deleted_at.isoformat() if client.deleted_at else None,
+            "force": force,
+            "retention_expired": is_expired,
+        },
+    )
+
+    db.delete(client)
+    db.commit()
+
+    return {
+        "status": "purged",
+        "client_id": client_id,
+        "message": "Client and associated records have been permanently purged.",
+    }
+
+
 @app.post("/api/v1/clients/{client_id}/accounts", status_code=201)
 def add_account(
     client_id: int,

@@ -60,6 +60,8 @@ CAPABILITIES: Dict[str, str] = {
     "client:read": "viewer",
     "client:write": "advisor",
     "client:archive": "admin",
+    "client:export": "advisor",
+    "client:purge": "admin",
     "policy:read": "viewer",
     "policy:draft": "advisor",
     # Activating a policy changes the limits the system will enforce. That is

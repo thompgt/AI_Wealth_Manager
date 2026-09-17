@@ -158,6 +158,10 @@ class Settings(BaseSettings):
     # If left empty in development, a deterministic key derived from JWT_SECRET
     # is used so development/testing works seamlessly out of the box.
     FIELD_ENCRYPTION_KEY: str = ""
+    # Regulatory retention period (SEC Rule 17a-4 / FINRA Rule 4511: 5-7 years).
+    # Soft-deleted / archived client records cannot be purged until this window expires,
+    # unless force=true is explicitly asserted by an administrator.
+    CLIENT_RETENTION_DAYS: int = 1825
 
     # Comma-separated list of origins allowed to call the API from a browser.
     CORS_ALLOW_ORIGINS: str = "http://localhost:8765,http://localhost:8766"

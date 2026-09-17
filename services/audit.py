@@ -52,6 +52,8 @@ class Action:
     CLIENT_CREATED = "client.created"
     CLIENT_UPDATED = "client.updated"
     CLIENT_ARCHIVED = "client.archived"
+    CLIENT_EXPORTED = "client.exported"
+    CLIENT_PURGED = "client.purged"
     ACCOUNT_CREATED = "account.created"
 
     POLICY_DRAFTED = "policy.drafted"
