@@ -17,7 +17,7 @@ each lands.
 | 2 | Split liveness from readiness; readiness checks deps and schema version | done |
 | 3 | Correlation ids that survive the request/job boundary | done |
 | 4 | One error model (RFC 9457) across every endpoint, leaking nothing | done |
-| 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | todo |
+| 5 | Graceful shutdown and reclaim of jobs orphaned by a dead worker | done |
 | 6 | Wall-clock budgets per node and per run | done |
 | 7 | Per-org daily LLM spend cap (a per-run one already exists) | done |
 | 8 | Postgres statement/lock timeouts and startup connect retry | done |

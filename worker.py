@@ -75,6 +75,9 @@ def main() -> int:
     # than one lost run.
     db = SessionLocal()
     try:
+        reclaimed = jobs.reclaim_orphaned_jobs(db)
+        if reclaimed:
+            logger.warning("Reclaimed %d orphaned job(s) from previous dead worker(s).", reclaimed)
         reaped = jobs.reap_stale_jobs(db)
         if reaped:
             logger.warning("Failed %d job(s) that exceeded the timeout.", reaped)

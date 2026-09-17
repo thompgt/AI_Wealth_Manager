@@ -1,8 +1,14 @@
-"""Unit tests for audit trail hash-chaining and tamper detection."""
-
 import pytest
-from db import AuditEvent, SessionLocal
+from db import AuditEvent, Organization, SessionLocal
 from services import audit
+
+
+def _ensure_org(db, org_id):
+    org = db.query(Organization).filter(Organization.id == org_id).first()
+    if not org:
+        org = Organization(id=org_id, name=f"Audit Org {org_id}", slug=f"audit-org-{org_id}")
+        db.add(org)
+        db.commit()
 
 
 def test_audit_hash_chain_genesis_and_continuation():
@@ -10,6 +16,7 @@ def test_audit_hash_chain_genesis_and_continuation():
     db = SessionLocal()
     test_org_id = 9999
     try:
+        _ensure_org(db, test_org_id)
         # Clear any preexisting events for test org
         db.query(AuditEvent).filter(AuditEvent.org_id == test_org_id).delete()
         db.commit()
@@ -18,7 +25,7 @@ def test_audit_hash_chain_genesis_and_continuation():
             db,
             org_id=test_org_id,
             action=audit.Action.CLIENT_CREATED,
-            user_id=1,
+            user_id=None,
             detail={"name": "Alice"},
         )
         db.commit()
@@ -30,7 +37,7 @@ def test_audit_hash_chain_genesis_and_continuation():
             db,
             org_id=test_org_id,
             action=audit.Action.POLICY_ACTIVATED,
-            user_id=1,
+            user_id=None,
             detail={"version": 1},
         )
         db.commit()
@@ -52,6 +59,7 @@ def test_audit_tamper_detection_modified_payload():
     db = SessionLocal()
     test_org_id = 9998
     try:
+        _ensure_org(db, test_org_id)
         db.query(AuditEvent).filter(AuditEvent.org_id == test_org_id).delete()
         db.commit()
 
@@ -71,7 +79,7 @@ def test_audit_tamper_detection_modified_payload():
         intact_after, problems_after = audit.verify_chain(db, test_org_id)
         assert intact_after is False
         assert len(problems_after) > 0
-        assert f"row {event1.id}" in problems_after[0]
+        assert f"id={event1.id}" in problems_after[0]
     finally:
         db.query(AuditEvent).filter(AuditEvent.org_id == test_org_id).delete()
         db.commit()
@@ -83,6 +91,7 @@ def test_audit_tamper_detection_deleted_row():
     db = SessionLocal()
     test_org_id = 9997
     try:
+        _ensure_org(db, test_org_id)
         db.query(AuditEvent).filter(AuditEvent.org_id == test_org_id).delete()
         db.commit()
 
@@ -99,7 +108,7 @@ def test_audit_tamper_detection_deleted_row():
 
         intact, problems = audit.verify_chain(db, test_org_id)
         assert intact is False
-        assert any(f"row {event3.id}" in p for p in problems)
+        assert any(f"id={event3.id}" in p for p in problems)
     finally:
         db.query(AuditEvent).filter(AuditEvent.org_id == test_org_id).delete()
         db.commit()

@@ -13,6 +13,7 @@ graph inline, holding a request thread for minutes while the client's own
 timeout raced it.
 """
 
+import logging
 import threading
 import time
 from collections import OrderedDict

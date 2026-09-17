@@ -166,11 +166,14 @@ def claim_next(db: Session, worker_id: str = WORKER_ID) -> Optional[Job]:
             or_(
                 Job.status == "queued",
                 # Reclaim a job whose worker died: claimed, still marked
-                # running, but no longer heartbeating.
+                # running, but no longer heartbeating, provided it has attempts left.
                 and_(
                     Job.status == "running",
-                    Job.heartbeat_at.isnot(None),
-                    Job.heartbeat_at < stale_before,
+                    Job.attempts < Job.max_attempts,
+                    or_(
+                        and_(Job.heartbeat_at.isnot(None), Job.heartbeat_at < stale_before),
+                        and_(Job.heartbeat_at.is_(None), Job.started_at.isnot(None), Job.started_at < stale_before),
+                    ),
                 ),
             )
         )
@@ -187,7 +190,14 @@ def claim_next(db: Session, worker_id: str = WORKER_ID) -> Optional[Job]:
             Job.id == candidate.id,
             or_(
                 Job.status == "queued",
-                and_(Job.status == "running", Job.heartbeat_at < stale_before),
+                and_(
+                    Job.status == "running",
+                    Job.attempts < Job.max_attempts,
+                    or_(
+                        and_(Job.heartbeat_at.isnot(None), Job.heartbeat_at < stale_before),
+                        and_(Job.heartbeat_at.is_(None), Job.started_at.isnot(None), Job.started_at < stale_before),
+                    ),
+                ),
             ),
         )
         .values(
@@ -242,6 +252,48 @@ def heartbeat(db: Session, job: Job, *, step: Optional[str] = None,
         job.cancel_requested,
     )
     return not job.cancel_requested
+
+
+class JobHeartbeatRunner:
+    """Background heartbeat updater for long-running job tasks.
+
+    Periodically touches `job.heartbeat_at` in the database so that healthy,
+    active worker runs are never misclassified as orphaned or dead workers,
+    even during prolonged blocking operations like LLM calls or macro fetches.
+    """
+
+    def __init__(self, job_id: str, interval: Optional[float] = None):
+        self.job_id = job_id
+        configured_stale = getattr(settings, "JOB_HEARTBEAT_STALE_SECONDS", 60)
+        self.interval = interval or max(2.0, min(15.0, configured_stale / 3.0))
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self):
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name=f"hb-{self.job_id[:8]}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def _run_loop(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                with SessionLocal() as db_hb:
+                    target = db_hb.query(Job).filter(Job.job_id == self.job_id).first()
+                    if target is not None and target.status == "running":
+                        target.heartbeat_at = utcnow()
+                        db_hb.commit()
+            except Exception:
+                pass
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
 
 
 # --- Worker ------------------------------------------------------------------
@@ -322,6 +374,12 @@ class JobWorker:
             job = claim_next(db)
             if job is None:
                 self._report_depth(db)
+                # Periodically sweep for dead-worker jobs and timed-out jobs
+                try:
+                    reclaim_orphaned_jobs(db)
+                    reap_stale_jobs(db)
+                except Exception:
+                    pass
                 return False
             self._run(db, job)
             return True
@@ -369,7 +427,8 @@ class JobWorker:
 
             logger.info("Running job %s (%s)", job.job_id, job.job_type)
             try:
-                result = handler(db, job)
+                with JobHeartbeatRunner(job.job_id):
+                    result = handler(db, job)
                 elapsed = time.monotonic() - started
 
                 db.refresh(job)
@@ -452,6 +511,73 @@ def stop_worker(timeout: Optional[float] = None) -> None:
         _worker.stop(timeout=timeout if timeout is not None
                      else settings.WORKER_SHUTDOWN_GRACE_SECONDS)
         _worker = None
+
+
+def reclaim_orphaned_jobs(db: Session, max_stale_seconds: Optional[int] = None) -> int:
+    """Find and reclaim running jobs whose worker died or stopped heartbeating.
+
+    If a worker process terminates abruptly (OOM killer, node eviction, SIGKILL),
+    its jobs sit marked as 'running' indefinitely without heartbeats.
+    - If attempts < max_attempts:
+        Requeues the job (status='queued', worker_id=None, heartbeat_at=None) so
+        another worker can pick it up.
+    - If attempts >= max_attempts:
+        Marks the job as failed with a diagnostic message.
+    """
+    stale_secs = max_stale_seconds if max_stale_seconds is not None else settings.JOB_HEARTBEAT_STALE_SECONDS
+    stale_before = utcnow() - timedelta(seconds=stale_secs)
+
+    orphaned = (
+        db.query(Job)
+        .filter(
+            Job.status == "running",
+            or_(
+                and_(Job.heartbeat_at.isnot(None), Job.heartbeat_at < stale_before),
+                and_(Job.heartbeat_at.is_(None), Job.started_at.isnot(None), Job.started_at < stale_before),
+            ),
+        )
+        .all()
+    )
+
+    reclaimed_count = 0
+    for job in orphaned:
+        worker_desc = job.worker_id or "unknown"
+        if job.attempts < job.max_attempts:
+            logger.warning(
+                "Reclaiming orphaned job %s (%s, attempt %d/%d) from worker %s; last heartbeat %s",
+                job.job_id,
+                job.job_type,
+                job.attempts,
+                job.max_attempts,
+                worker_desc,
+                job.heartbeat_at,
+            )
+            job.status = "queued"
+            job.worker_id = None
+            job.heartbeat_at = None
+            job.error = f"Reclaimed from dead worker {worker_desc} after heartbeat timed out."
+            jobs_enqueued.labels(job.job_type).inc()
+        else:
+            logger.error(
+                "Failing orphaned job %s (%s); worker %s stopped heartbeating and max attempts (%d) reached.",
+                job.job_id,
+                job.job_type,
+                worker_desc,
+                job.max_attempts,
+            )
+            job.status = "failed"
+            job.finished_at = utcnow()
+            job.error = (
+                f"Worker {worker_desc} stopped heartbeating; job exceeded max attempts "
+                f"({job.max_attempts})."
+            )
+            jobs_finished.labels(job.job_type, "failed").inc()
+        reclaimed_count += 1
+
+    if orphaned:
+        db.commit()
+
+    return reclaimed_count
 
 
 def reap_stale_jobs(db: Session) -> int:

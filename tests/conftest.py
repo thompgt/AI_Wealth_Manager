@@ -36,6 +36,26 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
 
+@pytest.fixture(scope="session", autouse=True)
+def setup_test_db():
+    from db import init_db, SessionLocal, Organization, ClientProfile
+    init_db()
+    db = SessionLocal()
+    try:
+        org = db.query(Organization).filter(Organization.id == 1).first()
+        if not org:
+            org = Organization(id=1, name="Default Test Org", slug="default-test-org")
+            db.add(org)
+            db.commit()
+        client = db.query(ClientProfile).filter(ClientProfile.id == 1).first()
+        if not client:
+            client = ClientProfile(id=1, org_id=1, name="Default Test Client")
+            db.add(client)
+            db.commit()
+    finally:
+        db.close()
+
+
 def make_price_frame(tickers, days=130, start_price=100.0, daily_drift=0.001):
     """A small deterministic synthetic price history, shaped like what
     services.market_data.fetch_historical_prices returns (a DataFrame
