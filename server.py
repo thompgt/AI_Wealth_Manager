@@ -824,6 +824,37 @@ def whoami(principal: Principal = Depends(get_principal)):
     }
 
 
+@app.get("/api/v1/auth/api-keys")
+def list_api_keys(
+    principal: Principal = Depends(require("admin:keys")),
+    db: Session = Depends(get_db),
+):
+    """List API keys with lifecycle metadata for audit and rotation planning."""
+    keys = (
+        scoped_query(db, ApiKey, principal)
+        .order_by(ApiKey.created_at.desc())
+        .all()
+    )
+    now = utcnow()
+    return [
+        {
+            "id": k.id,
+            "name": k.name,
+            "prefix": k.prefix,
+            "role": k.role,
+            "created_at": k.created_at.isoformat() if k.created_at else None,
+            "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+            "is_expired": k.expires_at is not None and k.expires_at <= now,
+            "is_revoked": k.revoked_at is not None,
+            "revoked_at": k.revoked_at.isoformat() if k.revoked_at else None,
+            "revocation_reason": k.revocation_reason,
+            "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
+            "superseded_by_id": k.superseded_by_id,
+        }
+        for k in keys
+    ]
+
+
 @app.post("/api/v1/auth/api-keys", status_code=201)
 def create_api_key(
     name: str = Query(min_length=1, max_length=120),
@@ -866,14 +897,94 @@ def create_api_key(
     }
 
 
+@app.post("/api/v1/auth/api-keys/{key_id}/rotate", status_code=201)
+def rotate_api_key(
+    key_id: int,
+    grace_period_hours: int = Query(default=24, ge=0, le=168),
+    expires_in_days: int = Query(default=90, ge=1, le=730),
+    name: Optional[str] = Query(default=None, max_length=120),
+    principal: Principal = Depends(require("admin:keys")),
+    db: Session = Depends(get_db),
+):
+    """Rotate an API key with an optional overlapping grace period for zero downtime.
+
+    Generates a new API key with identical capabilities and owner.
+    - If grace_period_hours > 0, the old key remains valid until the grace window ends.
+    - If grace_period_hours == 0, the old key is revoked immediately.
+    - The old key records superseded_by_id pointing to the new key.
+    - Secret for the new key is returned exactly once.
+    """
+    old_key = get_or_404(db, ApiKey, key_id, principal, "API key")
+    if old_key.revoked_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Cannot rotate an already-revoked API key.")
+
+    full_key, prefix, key_hash = generate_api_key()
+    new_name = name or f"{old_key.name} (rotated)"
+    now = utcnow()
+    new_key = ApiKey(
+        org_id=principal.org_id,
+        user_id=old_key.user_id,
+        name=new_name,
+        prefix=prefix,
+        key_hash=key_hash,
+        role=old_key.role,
+        expires_at=now + timedelta(days=expires_in_days),
+    )
+    db.add(new_key)
+    db.flush()
+
+    old_key.superseded_by_id = new_key.id
+    if grace_period_hours == 0:
+        old_key.revoked_at = now
+        old_key.revocation_reason = f"Rotated immediately; superseded by key #{new_key.id}"
+    else:
+        # Grace period: old key expires when grace period ends (or earlier if existing expiry is sooner)
+        grace_expiry = now + timedelta(hours=grace_period_hours)
+        if old_key.expires_at is None or old_key.expires_at > grace_expiry:
+            old_key.expires_at = grace_expiry
+        old_key.revocation_reason = f"Rotated with {grace_period_hours}h grace period; superseded by key #{new_key.id}"
+
+    record_audit(
+        db,
+        org_id=principal.org_id,
+        action=Action.API_KEY_ROTATED,
+        user_id=principal.user_id,
+        entity_type="api_key",
+        entity_id=new_key.id,
+        detail={
+            "old_key_id": old_key.id,
+            "old_prefix": old_key.prefix,
+            "new_key_id": new_key.id,
+            "new_prefix": new_key.prefix,
+            "grace_period_hours": grace_period_hours,
+        },
+    )
+    db.commit()
+
+    return {
+        "id": new_key.id,
+        "name": new_key.name,
+        "prefix": new_key.prefix,
+        "role": new_key.role,
+        "expires_at": new_key.expires_at.isoformat(),
+        "key": full_key,
+        "superseded_key_id": old_key.id,
+        "old_key_expires_at": old_key.expires_at.isoformat() if old_key.expires_at else None,
+        "old_key_revoked_at": old_key.revoked_at.isoformat() if old_key.revoked_at else None,
+        "warning": "This is the only time the new key is shown. Store it securely.",
+    }
+
+
 @app.delete("/api/v1/auth/api-keys/{key_id}", status_code=204)
 def revoke_api_key(
     key_id: int,
+    reason: Optional[str] = Query(default="administrative_revocation"),
     principal: Principal = Depends(require("admin:keys")),
     db: Session = Depends(get_db),
 ):
     api_key = get_or_404(db, ApiKey, key_id, principal, "API key")
     api_key.revoked_at = utcnow()
+    api_key.revocation_reason = (reason or "revoked")[:200]
     record_audit(
         db,
         org_id=principal.org_id,
@@ -881,6 +992,7 @@ def revoke_api_key(
         user_id=principal.user_id,
         entity_type="api_key",
         entity_id=key_id,
+        detail={"reason": api_key.revocation_reason, "prefix": api_key.prefix},
     )
     db.commit()
     return Response(status_code=204)

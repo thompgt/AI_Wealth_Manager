@@ -48,6 +48,7 @@ class Action:
     LOGIN_LOCKED = "auth.login.locked"
     API_KEY_CREATED = "auth.api_key.created"
     API_KEY_REVOKED = "auth.api_key.revoked"
+    API_KEY_ROTATED = "auth.api_key.rotated"
 
     CLIENT_CREATED = "client.created"
     CLIENT_UPDATED = "client.updated"

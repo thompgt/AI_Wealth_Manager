@@ -282,6 +282,8 @@ class ApiKey(Base):
     role = Column(String(32), nullable=False, default="viewer")
     expires_at = Column(DateTime, nullable=True)
     revoked_at = Column(DateTime, nullable=True)
+    revocation_reason = Column(String(200), nullable=True)
+    superseded_by_id = Column(Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True)
     last_used_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=utcnow)
 
