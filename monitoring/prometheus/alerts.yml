@@ -1,0 +1,89 @@
+groups:
+  - name: silent_degradation_alerts
+    rules:
+      - alert: HighSilentDegradationRate
+        expr: |
+          sum(rate(agent_degraded_total[5m]))
+          /
+          (sum(rate(analysis_runs_started_total[5m])) + 0.0001) > 0.15
+        for: 5m
+        labels:
+          severity: warning
+          tier: agent_quality
+        annotations:
+          summary: "High rate of silent deterministic agent degradation"
+          description: >
+            More than 15% of agent executions are silently falling back to deterministic
+            heuristics instead of LLM reasoning over the last 5 minutes while still returning HTTP 200.
+
+      - alert: LLMQuotaExhaustedOrProviderDown
+        expr: sum(rate(llm_calls_total{outcome=~"fallback|unavailable"}[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: critical
+          tier: inference
+        annotations:
+          summary: "LLM calls failing or falling back at scale"
+          description: >
+            Inference provider is failing or quota is exhausted. LLM calls are falling back
+            at > 0.5/s, compromising research and market regime analysis quality.
+
+      - alert: LowLLMBudgetHeadroom
+        expr: llm_budget_headroom_usd < 0.25 and llm_budget_headroom_usd >= 0
+        for: 3m
+        labels:
+          severity: warning
+          tier: inference
+        annotations:
+          summary: "LLM run budget nearly exhausted"
+          description: >
+            Run budget headroom has fallen below $0.25 USD. Subsequent agent nodes in
+            active runs risk forced degradation to deterministic rules.
+
+      - alert: MarketDataCircuitBreakerOpen
+        expr: market_data_circuit_open > 0
+        for: 2m
+        labels:
+          severity: critical
+          tier: market_data
+        annotations:
+          summary: "Market data provider circuit breaker tripped"
+          description: >
+            Market data provider {{ $labels.provider }} circuit breaker has been tripped open
+            for more than 2 minutes due to repeated upstream failures or timeouts.
+
+      - alert: StaleQuotesUsedInPortfolioSizing
+        expr: sum(rate(stale_quotes_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+          tier: trade_safety
+        annotations:
+          summary: "Stale market quotes used in sizing decisions"
+          description: >
+            Stale market quotes beyond tolerance thresholds are actively being used for
+            portfolio diagnostics, rebalancing, or position sizing.
+
+      - alert: ExcessiveGuardrailBlocks
+        expr: sum(rate(guardrail_blocks_total[10m])) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          tier: compliance
+        annotations:
+          summary: "Spike in deterministic guardrail blocks"
+          description: >
+            Guardrail blocks are occurring at > 2.0/s over 10m (rule: {{ $labels.rule }}).
+            Candidate generation or market inputs are deviating severely from policy constraints.
+
+      - alert: JobQueueBacklogStalled
+        expr: job_queue_depth > 10
+        for: 5m
+        labels:
+          severity: warning
+          tier: worker
+        annotations:
+          summary: "Job queue backlog accumulating"
+          description: >
+            More than 10 background analysis jobs are queued and waiting for worker processing
+            for over 5 minutes.

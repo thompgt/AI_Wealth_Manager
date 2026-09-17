@@ -26,7 +26,7 @@ each lands.
 | 11 | API key rotation and lifecycle visibility | done |
 | 12 | Prompt-injection red-team and golden-fixture agent evals | done |
 | 13 | CI: Postgres migrations, dependency audit, coverage floor | done |
-| 14 | Alert rules for the failure modes that return HTTP 200 | todo |
+| 14 | Alert rules for the failure modes that return HTTP 200 | done |
 | 15 | Load and soak harness, with capacity numbers written down | todo |
 | 16 | Operations runbook: deploy, rollback, restore, incident triage | todo |
 | 17 | Threat model, security policy, licence | todo |
