@@ -96,7 +96,16 @@ def tax_awareness_node(state: AgentState) -> dict:
                     if finding is not None:
                         wash_sale_flags.append(ticker)
                         wash_sale_detail.append(finding.to_dict())
-                        logger.info("[Tax] wash-sale flag on %s: %s", ticker, finding.reason)
+                        logger.warning("[Tax] Wash-sale rule triggered on %s: %s", ticker, finding.reason)
+                    else:
+                        logger.debug("[Tax] Wash-sale check passed for %s", ticker)
+
+                logger.info(
+                    "[Tax] Wash-sale evaluation: %d/%d candidates flagged (%s)",
+                    len(wash_sale_flags),
+                    len(candidates),
+                    ", ".join(wash_sale_flags) if wash_sale_flags else "none",
+                )
 
             # Harvesting opportunities are independent of the candidates: they
             # concern what the client already holds.
@@ -107,6 +116,7 @@ def tax_awareness_node(state: AgentState) -> dict:
                 harvest = tax_lots.harvestable_losses(
                     db, client, prices, min_loss=MIN_HARVEST_LOSS
                 )
+                logger.info("[Tax] Loss harvesting scan found %d position(s) with unrealized losses", len(harvest))
                 for entry in harvest[:5]:
                     conflict = entry.get("wash_sale_conflict")
                     tail = (

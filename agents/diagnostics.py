@@ -381,6 +381,20 @@ def diagnostics_node(state: AgentState) -> dict:
                     average_correlation, clusters, effective,
                 )
 
+                logger.info(
+                    "[Diagnostics] Portfolio stats: Sharpe=%.2f, Vol=%.2f%%, MaxDD=%.2f%%, Beta=%.2f, DivScore=%.2f, EffPos=%.1f",
+                    stats.get("sharpe_ratio") or 0.0,
+                    (stats.get("annual_volatility") or 0.0) * 100,
+                    (stats.get("max_drawdown") or 0.0) * 100,
+                    view.portfolio_beta() or 1.0,
+                    score,
+                    effective or 0.0,
+                )
+                if breaches:
+                    logger.warning("[Diagnostics] Policy breaches detected (%d): %s", len(breaches), breaches)
+                for idx, flaw in enumerate(flaws, 1):
+                    logger.info("[Diagnostics] Flaw #%d identified: %s", idx, flaw)
+
                 diagnostics = PortfolioDiagnostics(
                     total_value=round(view.total_value, 2),
                     invested_value=round(view.invested_value, 2),
@@ -418,6 +432,7 @@ def diagnostics_node(state: AgentState) -> dict:
                     f"{len({h.symbol for h in view.holdings})} position(s); {len(flaws)} "
                     f"finding(s), {len(breaches)} policy breach(es)."
                 )
+                logger.info("[Diagnostics] %s", ctx.summary)
 
                 for warning in view.warnings:
                     if "no current price" in warning.lower():

@@ -327,6 +327,13 @@ def suitability_node(state: AgentState) -> dict:
             ]
 
             for candidate in candidates:
+                logger.debug(
+                    "[Suitability] Testing candidate %s against policy limits (risk_tier=%s, max_pos=%.1f%%, max_sector=%.1f%%)",
+                    candidate["ticker"],
+                    policy.risk_tier,
+                    policy.max_position_pct * 100,
+                    policy.max_sector_pct * 100,
+                )
                 reason = (
                     _check_policy_exclusions(candidate, policy)
                     or _check_security_quality(candidate, policy)
@@ -376,6 +383,13 @@ def suitability_node(state: AgentState) -> dict:
             )
 
             allocated = sum(c["allocation_amount"] for c in approved_recommendations)
+            logger.info(
+                "[Suitability] Decision: %d/%d approved, $%,.0f total allocated, %d violation/note(s)",
+                len(approved_recommendations),
+                len(candidates),
+                allocated,
+                len(violations),
+            )
             ctx.output_snapshot = {
                 "approved": len(approved_recommendations),
                 "rejected": len(candidates) - len(approved_recommendations),

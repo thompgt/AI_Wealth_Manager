@@ -313,6 +313,13 @@ def stock_research_node(state: AgentState) -> dict:
                     entry["correlation"] = correlations.get(result.ticker)
                     shortlist.append(entry)
 
+                logger.info(
+                    "[Stock Research] Screened universe of %d -> %d eligible -> %d shortlist candidates",
+                    report.universe_size,
+                    report.eligible_size,
+                    len(shortlist),
+                )
+
                 try:
                     llm = get_chat_model(temperature=0.2)
                     structured = llm.with_structured_output(RankedCandidateList)
@@ -330,18 +337,27 @@ def stock_research_node(state: AgentState) -> dict:
                     )
                     by_ticker = {entry["ticker"]: entry for entry in shortlist}
 
+                    logger.info(
+                        "[Stock Research] LLM ranked %d picks: %s",
+                        len(ranked.picks),
+                        [p.ticker for p in ranked.picks],
+                    )
+
                     for pick in ranked.picks[:FINAL_PICKS]:
                         entry = by_ticker.get(pick.ticker.upper())
                         if entry is None:
-                            # A ticker outside the shortlist is a
-                            # hallucination. Dropped rather than looked up:
-                            # the point of screening first is that the model
-                            # cannot introduce something unscreened.
                             logger.warning(
                                 "[Research] discarding %s -- not in the screened shortlist.",
                                 pick.ticker,
                             )
                             continue
+                        logger.info(
+                            "[Stock Research] Candidate %s (conviction=%.2f): addresses '%s' (regime fit: %s)",
+                            pick.ticker,
+                            pick.confidence,
+                            pick.addresses_flaw,
+                            pick.regime_fit_rationale,
+                        )
                         candidates.append(
                             Candidate(
                                 ticker=entry["ticker"],

@@ -454,6 +454,13 @@ def market_regime_node(state: AgentState) -> dict:
 
         prices = fetch_historical_prices(ALL_TICKERS, years=MACRO_LOOKBACK_YEARS)
         signals = compute_supporting_signals(prices, ALL_TICKERS)
+        ratios = signals.get("ratio_signals") or {}
+        solos = signals.get("ticker_pct_change") or {}
+        logger.info(
+            "[Market Regime] Computed macro signals: ratios=%s, solo_trends=%s",
+            {k.split()[0]: v.get("change_pct") for k, v in ratios.items() if isinstance(v, dict)},
+            {k: round(v, 2) for k, v in solos.items() if isinstance(v, (int, float))},
+        )
 
         if signals.get("error") or signals.get("missing_tickers"):
             missing = signals.get("missing_tickers") or []
@@ -488,15 +495,27 @@ def market_regime_node(state: AgentState) -> dict:
                 ),
             )
         news_sentiment = news.sentiment if not news.degraded else None
+        logger.debug("[Market Regime] Macro news sentiment: %s (%d headlines)", news_sentiment, news.headline_count)
 
         # Deterministic first. It is both the fallback and the sanity check on
         # whatever the model says.
         deterministic = score_regime(signals, news_sentiment)
+        logger.info(
+            "[Market Regime] Rule-based deterministic assessment: %s (confidence=%.2f)",
+            deterministic["regime_label"],
+            deterministic["confidence"],
+        )
 
         try:
             assessment, usage = _invoke_llm(signals, format_for_prompt(news))
             ctx.record_usage(usage)
             ctx.model_used = settings.GEMINI_MODEL
+            logger.info(
+                "[Market Regime] LLM assessment completed: %s (confidence=%.2f, tokens=%s)",
+                assessment.regime_label,
+                assessment.confidence,
+                usage,
+            )
             regime = MarketRegime(
                 regime_label=assessment.regime_label,
                 confidence=round(float(assessment.confidence), 3),
@@ -512,6 +531,7 @@ def market_regime_node(state: AgentState) -> dict:
                 )
         except LLMUnavailable as exc:
             regime = deterministic
+            logger.info("[Market Regime] LLM unavailable; using deterministic fallback: %s", exc)
             ctx.degrade(
                 reason="no_api_key",
                 detail=str(exc),
@@ -524,6 +544,7 @@ def market_regime_node(state: AgentState) -> dict:
             )
         except Exception as exc:  # noqa: BLE001 -- degrade rather than fail the run
             regime = deterministic
+            logger.warning("[Market Regime] LLM error; falling back to deterministic: %s", exc)
             ctx.degrade(
                 reason=classify_failure(exc),
                 detail=f"{type(exc).__name__}: {exc}",
