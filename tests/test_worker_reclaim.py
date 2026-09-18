@@ -2,7 +2,6 @@
 
 import time
 from datetime import timedelta
-import pytest
 from db import Job, SessionLocal, utcnow
 from config import settings
 from services import jobs

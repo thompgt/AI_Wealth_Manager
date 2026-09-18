@@ -1630,6 +1630,7 @@ def activate_policy(
 @app.post("/api/v1/clients/{client_id}/runs", status_code=202)
 def trigger_run(
     client_id: int,
+    request: Request,
     principal: Principal = Depends(require("run:trigger")),
     db: Session = Depends(get_db),
 ):

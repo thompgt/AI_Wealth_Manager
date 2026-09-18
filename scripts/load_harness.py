@@ -10,22 +10,18 @@ Measures:
 
 from dataclasses import dataclass, field
 import argparse
-import asyncio
-from datetime import datetime, timedelta, timezone
 import os
-import secrets
 import sys
 import time
 from typing import Any, Dict, List, Optional
-import statistics
 
 from fastapi.testclient import TestClient
-import jwt
 
 # Ensure project root is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from config import settings
+from db import Organization, SessionLocal, User, init_db
+from security import create_access_token, hash_password
 from server import app
 
 
@@ -81,11 +77,6 @@ def _get_process_memory_mb() -> float:
         return process.memory_info().rss / (1024 * 1024)
     except Exception:
         return 0.0
-
-
-from db import Organization, SessionLocal, User, init_db
-from security import create_access_token, hash_password
-
 
 def _ensure_bench_user() -> User:
     init_db()

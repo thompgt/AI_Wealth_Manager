@@ -11,9 +11,8 @@ all calls degrade cleanly to no-ops without interrupting transactional workflows
 """
 
 import json
-from datetime import date, datetime, timezone
-from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
     Column,
@@ -24,11 +23,8 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
-    Table,
     Text,
     create_engine,
-    inspect,
-    select,
     text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker

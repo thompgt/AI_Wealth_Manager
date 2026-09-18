@@ -1,7 +1,6 @@
 """Unit tests for MySQL analytical store and replication service."""
 
 from datetime import date, datetime
-import pytest
 from services import mysql_analytics
 from config import settings
 

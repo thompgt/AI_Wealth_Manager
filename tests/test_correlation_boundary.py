@@ -1,6 +1,5 @@
 """Unit tests for correlation ID propagation across the request and job boundary."""
 
-import pytest
 from db import Job, SessionLocal
 from services import jobs
 from logging_setup import current_context

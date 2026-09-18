@@ -1,7 +1,6 @@
 """Unit tests for field-level encryption of client PII at rest."""
 
-from datetime import datetime, timezone
-import pytest
+from datetime import datetime
 from sqlalchemy import text
 from config import Settings
 from db import ClientProfile, Organization, SessionLocal

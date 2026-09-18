@@ -27,8 +27,12 @@ Design notes that are easy to miss from the model definitions alone:
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import time
 from typing import Optional
 
+from logging_setup import get_logger
+from config import settings
+from services.encryption import EncryptedDateTime, EncryptedString, EncryptedText
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -50,8 +54,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
-from config import settings
-from services.encryption import EncryptedDateTime, EncryptedString, EncryptedText
+logger = get_logger(__name__)
 
 # --- Engine ------------------------------------------------------------------
 
@@ -103,11 +106,6 @@ def _sqlite_pragmas(dbapi_connection, connection_record):
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
-
-import time
-from logging_setup import get_logger
-
-logger = get_logger(__name__)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()

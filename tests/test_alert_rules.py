@@ -14,7 +14,6 @@ Verifies Production Readiness Item 14:
 from pathlib import Path
 import re
 import yaml
-import pytest
 
 import metrics
 

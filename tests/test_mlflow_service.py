@@ -1,6 +1,5 @@
 """Unit tests for MLflow experiment and metrics tracking service."""
 
-import pytest
 from services import mlflow_service
 from config import settings
 

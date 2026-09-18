@@ -8,9 +8,6 @@ Covers Production Readiness Item 12:
    across core client personas (Conservative, Balanced Growth, Tax-Sensitive).
 """
 
-from datetime import datetime
-from decimal import Decimal
-import pytest
 
 from agents import diagnostics, suitability
 from agents.stock_research import _build_prompt

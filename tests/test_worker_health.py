@@ -2,7 +2,6 @@
 
 import socket
 from datetime import timedelta
-import pytest
 from db import Job, SessionLocal, utcnow
 from config import settings
 import worker_health

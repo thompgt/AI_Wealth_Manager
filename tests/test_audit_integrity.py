@@ -1,4 +1,3 @@
-import pytest
 from db import AuditEvent, Organization, SessionLocal
 from services import audit
 
@@ -65,7 +64,7 @@ def test_audit_tamper_detection_modified_payload():
 
         event1 = audit.record(db, org_id=test_org_id, action=audit.Action.ORDER_CREATED, detail={"amt": 100})
         db.commit()
-        event2 = audit.record(db, org_id=test_org_id, action=audit.Action.ORDER_FILLED, detail={"amt": 100})
+        audit.record(db, org_id=test_org_id, action=audit.Action.ORDER_FILLED, detail={"amt": 100})
         db.commit()
 
         # Verify intact initially
@@ -95,7 +94,7 @@ def test_audit_tamper_detection_deleted_row():
         db.query(AuditEvent).filter(AuditEvent.org_id == test_org_id).delete()
         db.commit()
 
-        event1 = audit.record(db, org_id=test_org_id, action=audit.Action.CLIENT_CREATED, detail={"v": 1})
+        audit.record(db, org_id=test_org_id, action=audit.Action.CLIENT_CREATED, detail={"v": 1})
         db.commit()
         event2 = audit.record(db, org_id=test_org_id, action=audit.Action.CLIENT_UPDATED, detail={"v": 2})
         db.commit()

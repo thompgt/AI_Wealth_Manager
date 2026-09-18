@@ -12,7 +12,7 @@ import hashlib
 from datetime import datetime
 from typing import Any, Optional
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy.types import DateTime, Text, TypeDecorator
+from sqlalchemy.types import Text, TypeDecorator
 
 from config import settings
 from logging_setup import get_logger

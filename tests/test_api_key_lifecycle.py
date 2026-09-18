@@ -1,10 +1,9 @@
 """Unit tests for API key lifecycle visibility, revocation reasons, and zero-downtime rotation."""
 
-from datetime import timedelta
 import pytest
 from fastapi.testclient import TestClient
 
-from db import ApiKey, AuditEvent, Organization, SessionLocal, User, utcnow
+from db import ApiKey, AuditEvent, Organization, SessionLocal, User
 from services.audit import Action
 from security import create_access_token
 from server import app
@@ -143,7 +142,7 @@ def test_rotate_api_key_immediate(key_env):
     assert rot_resp.status_code == 201
     rot_data = rot_resp.json()
     new_secret = rot_data["key"]
-    new_id = rot_data["id"]
+    assert rot_data["id"] > 0
     assert rot_data["superseded_key_id"] == old_id
 
     # Old key is immediately rejected

@@ -6,7 +6,6 @@ Covers Production Readiness Item 15:
 - Error rate and throughput metrics
 """
 
-import pytest
 from scripts.load_harness import BenchmarkResult, run_benchmark
 
 
