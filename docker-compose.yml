@@ -136,17 +136,26 @@ services:
       retries: 3
       start_period: 30s
 
-  dashboard:
+  frontend:
+    build: ./frontend
+    ports:
+      - "8765:8765"
+    environment:
+      PORT: 8765
+      VITE_API_URL: http://api:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  dashboard-legacy:
     build: .
     environment:
       <<: *app-env
       JOB_WORKER_ENABLED: "false"
-      # The dashboard is an HTTP client of the API and holds no business
-      # logic, so it needs the API's address and a key, not the database.
       WEALTH_API_URL: http://api:8000
-    command: ["solara", "run", "app.py", "--host", "0.0.0.0", "--port", "8765"]
+    command: ["solara", "run", "app.py", "--host", "0.0.0.0", "--port", "8766"]
     ports:
-      - "8765:8765"
+      - "8766:8766"
     depends_on:
       - api
     restart: unless-stopped
