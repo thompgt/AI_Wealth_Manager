@@ -57,6 +57,7 @@ def upgrade() -> None:
             type_=EncryptedDateTime(),
             existing_type=sa.DateTime(),
             existing_nullable=True,
+            postgresql_using='date_of_birth::text',
         )
 
 
@@ -68,6 +69,7 @@ def downgrade() -> None:
             type_=sa.DateTime(),
             existing_type=EncryptedDateTime(),
             existing_nullable=True,
+            postgresql_using='date_of_birth::timestamp without time zone',
         )
         batch_op.alter_column(
             'phone',
