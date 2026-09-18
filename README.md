@@ -14,6 +14,9 @@ Deterministic guardrails with **zero LLM in the control path** enforce hard suit
 ## Tech Stack
 
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React_18-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)
+![Node.js](https://img.shields.io/badge/Node.js-339933?style=for-the-badge&logo=nodedotjs&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-646CFF?style=for-the-badge&logo=vite&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1C3C3C?style=for-the-badge&logo=langgraph&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-336791?style=for-the-badge&logo=postgresql&logoColor=white)
 ![MySQL](https://img.shields.io/badge/MySQL_Analytics-4479A1?style=for-the-badge&logo=mysql&logoColor=white)
@@ -141,10 +144,15 @@ docker compose up -d --build
    python worker.py
    ```
 
-4. **Launch the Solara Dashboard:**
+4. **Launch the Node.js Frontend Dashboard:**
    ```bash
-   solara run app.py --port 8765
+   cd frontend
+   npm install
+   npm run dev
    ```
+   *The interactive React/Vite dashboard runs at http://localhost:5173 (proxied to the FastAPI server on port 8000).*
+
+   *(Optional: The legacy Solara dashboard remains runnable via `solara run app.py --port 8766`).*
 
 ---
 

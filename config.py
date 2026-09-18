@@ -164,7 +164,7 @@ class Settings(BaseSettings):
     CLIENT_RETENTION_DAYS: int = 1825
 
     # Comma-separated list of origins allowed to call the API from a browser.
-    CORS_ALLOW_ORIGINS: str = "http://localhost:8765,http://localhost:8766"
+    CORS_ALLOW_ORIGINS: str = "http://localhost:5173,http://localhost:3000,http://localhost:8765,http://localhost:8766"
     # Requests per minute per authenticated principal, and the much tighter
     # budget for the endpoint that triggers a multi-agent run.
     RATE_LIMIT_PER_MINUTE: int = 120
